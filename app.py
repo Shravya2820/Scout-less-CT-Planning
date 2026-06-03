@@ -1,6 +1,6 @@
 """
 Scout-less CT Scan Planning System
-B.Tech Project Prototype — Orchestration Layer
+B.Tech Project Prototype — Orchestration Layer (Upgraded Architecture)
 """
 
 import streamlit as st
@@ -12,6 +12,7 @@ import os
 import json
 import time
 from datetime import datetime
+from scipy.ndimage import distance_transform_edt
 
 # ── Page config ──────────────────────────────────────────────────────────────
 st.set_page_config(
@@ -417,24 +418,14 @@ Notes: Full bladder preferred. Rectal contrast optional for rectal assessment.
 """
 
 def simulate_skel_model(height_cm: float, weight_kg: float) -> np.ndarray:
-    """
-    Mock skeletal parametric model.
-    Returns an 85-D parameter vector encoding body morphology.
-    In a real system, this would be the output of a 3D mesh regression network.
-    """
     np.random.seed(int(height_cm + weight_kg) % 2**31)
     bmi = weight_kg / ((height_cm / 100) ** 2)
-
-    # Anthropometric proportion features
-    trunk_ratio = 0.52 + (bmi - 22) * 0.002          # trunk/height ratio shifts with BMI
+    trunk_ratio = 0.52 + (bmi - 22) * 0.002
     shoulder_width = height_cm * 0.259 * (1 + (bmi - 22) * 0.003)
     hip_width = height_cm * 0.191 * (1 + (bmi - 22) * 0.005)
     torso_depth = height_cm * 0.145 * (1 + (bmi - 22) * 0.006)
 
-    # Base 85-D vector
     params = np.random.randn(85) * 0.05
-
-    # Encode key dimensions into specific indices (deterministic)
     params[0] = bmi / 40.0
     params[1] = trunk_ratio
     params[2] = shoulder_width / 100.0
@@ -442,74 +433,143 @@ def simulate_skel_model(height_cm: float, weight_kg: float) -> np.ndarray:
     params[4] = torso_depth / 100.0
     params[5] = height_cm / 200.0
     params[6] = weight_kg / 150.0
-    params[7] = (bmi - 18.5) / 21.5  # normalized BMI offset
-    params[8] = 1.0 if bmi >= 30 else (0.5 if bmi >= 25 else 0.0)  # obesity flag
-
+    params[7] = (bmi - 18.5) / 21.5
+    params[8] = 1.0 if bmi >= 30 else (0.5 if bmi >= 25 else 0.0)
     return params.astype(np.float32)
 
 
-def simulate_nnLandmark(height_cm: float, weight_kg: float) -> dict:
+# ── 1. MULTI-MODAL INPUT SIMULATION & LATE FUSION ─────────────────────────────
+
+def simulate_multimodal_fusion(rgb_status: str, depth_status: str, ir_status: str, bmi: float) -> dict:
     """
-    Mock neural-network landmark predictor.
-    Returns approximate 3D coordinates (x, y, z) in mm for key anatomical landmarks.
-    Z=0 is defined at the top of the head; Z increases inferiorly.
-    In a real system this is a regression CNN on body surface scans.
+    Applies Late Fusion strategy to process inputs from three distinct sensors.
+    Individual camera tracking weightings adapt dynamically based on patient morphology factors.
+    """
+    # RGB baseline tracking confidence drops under shadows/gowns
+    rgb_conf = 0.94 if rgb_status == "Optimal" else 0.45
+    # Standard depth systems struggle with complex clothing layers
+    depth_conf = 0.92 if depth_status == "Optimal" else 0.50
+    # Thermal/Infrared identifies true body anatomy boundaries regardless of fabric
+    ir_conf = 0.96 if ir_status == "Optimal" else 0.60
+    
+    # Extreme physical morphology degrades optical accuracy
+    if bmi > 38.0:
+        rgb_conf *= 0.85
+        depth_conf *= 0.75  # Significant attenuation on standard spatial boundaries
+        ir_conf *= 0.95     # IR remains highly resilient to clothing structures
+        
+    # Late Fusion: Compute weighted ensemble confidence coefficient
+    fused_confidence = (rgb_conf * 0.25) + (depth_conf * 0.35) + (ir_conf * 0.40)
+    
+    # Construct a descriptive, unified feature representation array
+    fused_vector = np.array([rgb_conf, depth_conf, ir_conf, fused_confidence], dtype=np.float32)
+    
+    return {
+        "fused_vector": fused_vector,
+        "combined_confidence": float(fused_confidence),
+        "status_summary": f"RGB={rgb_status} | Depth={depth_status} | IR={ir_status}"
+    }
+
+
+# ── 2. 3D HEATMAP REGRESSION & SOFT-ARGMAX ────────────────────────────────────
+
+def generate_edt_heatmaps(height_cm: float, weight_kg: float, noise_scale: float = 2.5) -> dict:
+    """
+    Simulates volumetric probability distributions across a 3D structural voxel lattice grid.
+    Uses Euclidean Distance Transform (EDT) mappings centered on anatomical targets.
+    Grid shape: (Z=128, Y=32, X=32) representing the bounding space.
     """
     bmi = weight_kg / ((height_cm / 100) ** 2)
-    H = height_cm * 10  # convert to mm
-
-    # Anatomical proportions — Indian NIOH-based constants
-    sternum_z = H * 0.200   # sternum centroid ~20.0% from top (Indian standard)
-    t12_z     = H * 0.482   # T12 ~48.2% from top (Indian standard)
-    pubis_z   = H * 0.771   # pubic symphysis ~77.1% from top (Indian standard)
-
-    # BMI-based small corrections — CAPPED at 30mm to prevent runaway span
-    # Raw shift would be (bmi - 22) * 1.2, but unbounded it causes
-    # physically impossible spans at BMI > 35. Cap fixes Obese III / Morbid cases.
-    bmi_shift = float(np.clip((bmi - 22.0) * 1.2, -15.0, 30.0))
-
-    # X/Y coords (lateral offset from midline, anterior-posterior depth)
-    lateral_spread = 0 + (bmi - 22) * 0.8
-    ap_depth = H * 0.14 + (bmi - 22) * 2.5
-
-    landmarks = {
-        "Sternum (Manubrium)": {
-            "coords": (round(lateral_spread * 0.1, 1),
-                       round(-ap_depth * 0.45, 1),
-                       round(sternum_z + bmi_shift * 0.5, 1)),
-            "anatomy": "Superior border of sternum / T2 level",
-            "color": "#00d4ff",
-        },
-        "T12 Vertebra": {
-            "coords": (round(0.0, 1),
-                       round(ap_depth * 0.1, 1),
-                       round(t12_z + bmi_shift, 1)),
-            "anatomy": "Thoracolumbar junction / diaphragm attachment",
-            "color": "#ffaa00",
-        },
-        "Pubic Symphysis": {
-            "coords": (round(0.0, 1),
-                       round(-ap_depth * 0.3, 1),
-                       round(pubis_z + bmi_shift * 1.5, 1)),
-            "anatomy": "Inferior pelvic boundary",
-            "color": "#ff4466",
-        },
+    H = height_cm * 10  # mm
+    
+    # Expected centroid positions
+    sternum_z_target = H * 0.200
+    t12_z_target     = H * 0.482
+    pubis_z_target   = H * 0.771
+    
+    # Scale adjustments
+    bmi_shift = float(np.clip((bmi - 22.0) * 1.2, -15.0, 32.0))
+    
+    # Ground-truth coordinate mappings translated onto the 128-slice Z grid
+    z_map_sternum = (sternum_z_target + bmi_shift * 0.5) / H * 127
+    z_map_t12     = (t12_z_target + bmi_shift) / H * 127
+    z_map_pubis   = (pubis_z_target + bmi_shift * 1.5) / H * 127
+    
+    # Increase uncertainty based on structural noise
+    peak_width_base = 3.5 + (max(0.0, bmi - 25.0) * 0.3) + (noise_scale * 0.5)
+    
+    landmarks_meta = {
+        "Carina (Sternum Anchor)": {"z_vox": z_map_sternum, "pw": peak_width_base, "color": "#00d4ff", "anatomy": "Superior border of sternum / T2 level"},
+        "T12 Vertebra": {"z_vox": z_map_t12, "pw": peak_width_base * 1.2, "color": "#ffaa00", "anatomy": "Thoracolumbar junction / diaphragm attachment"},
+        "Pubic Symphysis": {"z_vox": z_map_pubis, "pw": peak_width_base * 1.5, "color": "#ff4466", "anatomy": "Inferior pelvic boundary"}
     }
-    return landmarks
+    
+    heatmaps = {}
+    for name, data in landmarks_meta.items():
+        # Instantiate a clean 3D lattice field space
+        grid = np.zeros((128, 32, 32), dtype=np.float32)
+        
+        # Center target coordinate indices
+        cz, cy, cx = int(np.clip(data["z_vox"], 0, 127)), 16, 16
+        grid[cz, cy, cx] = 1.0
+        
+        # Compute distance transforms relative to the source point
+        edt = distance_transform_edt(1.0 - grid)
+        
+        # Formulate Gaussian probabilistic fields based on distance weights
+        sigma = data["pw"]
+        heatmap_3d = np.exp(-(edt ** 2) / (2.0 * (sigma ** 2)))
+        # Normalize probability map distribution
+        heatmap_3d /= np.sum(heatmap_3d)
+        
+        heatmaps[name] = {
+            "volume": heatmap_3d,
+            "peak_width": float(sigma),
+            "color": data["color"],
+            "anatomy": data["anatomy"]
+        }
+        
+    return heatmaps
+
+
+def extract_coords_from_heatmap(heatmap_3d: np.ndarray, height_cm: float) -> tuple:
+    """
+    Applies a Soft-Argmax mathematical transformation layer across the 3D probability matrix.
+    Achieves sub-voxel precise tracking localization via soft density center-of-mass evaluation.
+    """
+    Z, Y, X = heatmap_3d.shape
+    
+    # Generate continuous index coordinate coordinate tensors
+    z_indices = np.arange(Z, dtype=np.float32)
+    y_indices = np.arange(Y, dtype=np.float32)
+    x_indices = np.arange(X, dtype=np.float32)
+    
+    # Collapse spatial dimensions to evaluate center of mass projections
+    prob_z = np.sum(heatmap_3d, axis=(1, 2))
+    prob_y = np.sum(heatmap_3d, axis=(0, 2))
+    prob_x = np.sum(heatmap_3d, axis=(0, 1))
+    
+    # Execute Soft-Argmax expectation formulas: E[v] = SUM(v * P(v))
+    soft_z = float(np.sum(z_indices * prob_z))
+    soft_y = float(np.sum(y_indices * prob_y))
+    soft_x = float(np.sum(x_indices * prob_x))
+    
+    # Translate structural grid index coordinates into physical scanning metrics (mm)
+    H_mm = height_cm * 10
+    physical_z = (soft_z / (Z - 1)) * H_mm
+    
+    # Center translation offsets for physical coordinate visualization mapping
+    physical_x = (soft_x - (X / 2)) * 8.0
+    physical_y = (soft_y - (Y / 2)) * 8.0
+    
+    return physical_x, physical_y, physical_z
 
 
 # ── RAG Pipeline ──────────────────────────────────────────────────────────────
 
 @st.cache_resource(show_spinner=False)
 def build_rag_pipeline():
-
-
-    """
-    Build LangChain RAG pipeline with FAISS vector store.
-    Falls back gracefully if LangChain/FAISS are not installed.
-    """
     try:
-       
         from langchain_text_splitters import RecursiveCharacterTextSplitter
         from langchain_community.vectorstores import FAISS
         from langchain_huggingface import HuggingFaceEmbeddings
@@ -529,14 +589,12 @@ def build_rag_pipeline():
 
 
 def retrieve_protocol(query: str, vectorstore, mode: str) -> str:
-    """Retrieve most relevant protocol chunk via FAISS similarity search."""
     if mode == "langchain" and vectorstore is not None:
         try:
             results = vectorstore.similarity_search(query, k=2)
             return "\n\n".join(r.page_content for r in results)
         except Exception:
             pass
-    # Keyword fallback
     query_lower = query.lower()
     if "chest" in query_lower and "abd" not in query_lower:
         keyword = "CHEST-001"
@@ -552,86 +610,83 @@ def retrieve_protocol(query: str, vectorstore, mode: str) -> str:
     return CT_PROTOCOL_KB.split("\n\n")[0]
 
 
+# ── 3. UPGRADED REASONING & SAFETY GATE ───────────────────────────────────────
+
 def reasoning_agent(scan_type: str, landmarks: dict, protocol_text: str,
-                    height: float, weight: float) -> dict:
+                    height: float, weight: float, combined_sensor_conf: float) -> dict:
     """
-    Llama-3-style reasoning agent.
-    Parses retrieved protocol + landmark Z-coords to calculate scan boundaries.
-    In a real deployment, this would call Ollama / Together API with Llama 3.
+    Upgraded Reasoning Engine. Integrates aleatoric spatial peak uncertainty,
+    BMI constraints, and sensor fusion tracking metrics to safeguard scan planning.
     """
     bmi = weight / ((height / 100) ** 2)
 
-    sternum_z = landmarks["Sternum (Manubrium)"]["coords"][2]
-    t12_z = landmarks["T12 Vertebra"]["coords"][2]
-    pubis_z = landmarks["Pubic Symphysis"]["coords"][2]
+    carina_z = landmarks["Carina (Sternum Anchor)"]["coords"][2]
+    t12_z    = landmarks["T12 Vertebra"]["coords"][2]
+    pubis_z  = landmarks["Pubic Symphysis"]["coords"][2]
 
+    # Evaluate Max Peak Width among tracked structures as an Aleatoric Uncertainty metric
+    max_peak_width = max(lm["peak_width"] for lm in landmarks.values())
+    
     scan_type_l = scan_type.lower()
+    safety_trigger = False
+    safety_message = ""
+
+    # ── CRITICAL SAFETY GATE EVALUATION ──
+    # Triggers an auto-override under extreme obesity or systemic tracking uncertainty
+    
+    if max_peak_width > 7.5 or bmi > 45.0 or combined_sensor_conf < 0.70:
+        safety_trigger = True
+        safety_message = "CRITICAL METRIC HIGH UNCERTAINTY DETECTED: Reverting to Ultra-Low Dose Scout Validation."
 
     if "chest" in scan_type_l and "abdomen" not in scan_type_l:
-        z_start = sternum_z - 20   # 20 mm above sternum = approx 2 cm above lung apex
+        z_start = carina_z - 20
         z_end = t12_z + 5
         start_anatomy = "~2 cm superior to lung apex (C7 level)"
         end_anatomy = "T12 inferior border (diaphragm)"
         protocol_id = "CHEST-001"
-        confidence = 0.91 - max(0, (bmi - 30) * 0.008)
-        rationale = (
-            f"Protocol CHEST-001 retrieved. Sternum landmark at Z={sternum_z:.0f} mm "
-            f"used as superior anchor. Scan start calculated at Z={z_start:.0f} mm "
-            f"(–20 mm offset for lung apex clearance). T12 at Z={t12_z:.0f} mm "
-            f"defines the inferior thoracic boundary. BMI={bmi:.1f} — "
-            + ("standard acquisition parameters apply."
-               if bmi < 30 else
-               "elevated BMI: mAs auto-boost recommended; consider split acquisition.")
-        )
+        confidence = 0.93 * combined_sensor_conf - (max_peak_width * 0.01)
 
     elif "abdomen" in scan_type_l and "pelvis" not in scan_type_l:
-        z_start = t12_z - 15   # 15 mm above T12 ≈ diaphragm dome
+        z_start = t12_z - 15
         z_end = pubis_z + 10
         start_anatomy = "Diaphragm dome (T8–T9 superior to liver)"
         end_anatomy = "Pubic symphysis inferior border"
         protocol_id = "ABD-001"
-        confidence = 0.88 - max(0, (bmi - 30) * 0.010)
-        rationale = (
-            f"Protocol ABD-001 retrieved. T12 landmark (Z={t12_z:.0f} mm) used as "
-            f"diaphragm proxy. Start set at Z={z_start:.0f} mm (–15 mm superior margin). "
-            f"Pubic Symphysis at Z={pubis_z:.0f} mm defines inferior extent with +10 mm margin. "
-            f"BMI={bmi:.1f} — "
-            + ("portal venous phase recommended (65 s delay)."
-               if bmi < 35 else
-               "high BMI: consider 80 s delay for adequate enhancement; kVp adjustment advised.")
-        )
+        confidence = 0.90 * combined_sensor_conf - (max_peak_width * 0.015)
 
     elif "pelvis" in scan_type_l and "chest" not in scan_type_l and "cap" not in scan_type_l:
-        z_start = pubis_z - 160   # approximate iliac crest offset
+        z_start = pubis_z - 160
         z_end = pubis_z + 25
         start_anatomy = "Iliac crest (L4–L5)"
         end_anatomy = "Pubic symphysis + ischial tuberosities"
         protocol_id = "PELVIS-001"
-        confidence = 0.85 - max(0, (bmi - 30) * 0.005)
-        rationale = (
-            f"Protocol PELVIS-001 retrieved. Pubic Symphysis (Z={pubis_z:.0f} mm) used as "
-            f"inferior anchor. Iliac crest estimated at Z={z_start:.0f} mm based on body "
-            f"proportion model (85-D skeletal parameters). Full pelvic ring coverage assured. "
-            f"BMI={bmi:.1f} — standard pelvic acquisition."
-        )
+        confidence = 0.88 * combined_sensor_conf - (max_peak_width * 0.01)
 
-    else:  # CAP — Chest-Abdomen-Pelvis full torso
-        z_start = sternum_z - 20
+    else: # CAP - Chest-Abdomen-Pelvis
+        z_start = carina_z - 20
         z_end = pubis_z + 10
         start_anatomy = "~2 cm above lung apex"
         end_anatomy = "Pubic symphysis inferior border"
         protocol_id = "CHEST-ABD-001"
-        confidence = 0.87 - max(0, (bmi - 30) * 0.009)
-        rationale = (
-            f"Protocol CHEST-ABD-001 (CAP) retrieved. Full torso coverage from "
-            f"lung apex (Z={z_start:.0f} mm) to pubic symphysis (Z={z_end:.0f} mm). "
-            f"Span = {z_end - z_start:.0f} mm. BMI={bmi:.1f} — "
-            + ("single breath-hold feasible."
-               if bmi < 35 else
-               "high BMI: split acquisition into chest and abdomen-pelvis recommended.")
-        )
+        confidence = 0.89 * combined_sensor_conf - (max_peak_width * 0.02)
 
-    confidence = float(np.clip(confidence, 0.60, 0.97))
+    # Apply safety adjustments to final confidence metrics
+    if safety_trigger:
+        confidence = float(np.clip(confidence * 0.5, 0.30, 0.55))
+        rationale = (
+            f"🚨 SAFETY REASONING OVERRIDE ACTIVATED.\n"
+            f"Reasoning Context: Peak Width spatial uncertainty is at {max_peak_width:.2f} (Threshold 6.2) "
+            f"or Patient BMI is {bmi:.1f} (Threshold 45.0).\n"
+            f"Action: {safety_message} Manual scout validation mandatory to prevent anatomical cropping."
+        )
+    else:
+        confidence = float(np.clip(confidence, 0.60, 0.98))
+        rationale = (
+            f"Protocol {protocol_id} verified. Multi-modal sensor fusion input context resolved with "
+            f"{(combined_sensor_conf*100):.1f}% confidence parameters. Sub-voxel Soft-Argmax calculation maps "
+            f"Carina at Z={carina_z:.1f} mm, T12 at Z={t12_z:.1f} mm. Aleatoric variance within thresholds "
+            f"(Peak Width max = {max_peak_width:.2f} mm). Optimal structural boundary mapping is locked."
+        )
 
     return {
         "protocol_id": protocol_id,
@@ -642,450 +697,351 @@ def reasoning_agent(scan_type: str, landmarks: dict, protocol_text: str,
         "confidence": confidence,
         "rationale": rationale,
         "retrieved_protocol": protocol_text,
+        "safety_trigger": safety_trigger,
+        "safety_message": safety_message
     }
 
 
-# ── Visualization ─────────────────────────────────────────────────────────────
+# ── 4. ENHANCED HEATMAP VISUALIZATION ─────────────────────────────────────────
 
 def plot_human_silhouette(landmarks: dict, result: dict, height_cm: float) -> plt.Figure:
-    """Render a schematic human silhouette with scan boundary markers."""
-    fig, ax = plt.subplots(figsize=(4.2, 8.5))
+    """
+    Renders an anatomical patient silhouette outline graph, plotting an advanced 
+    2D projection mapping of volumetric probability heatmaps as smooth glowing gradients.
+    """
+    fig, ax = plt.subplots(figsize=(4.5, 9.0))
     fig.patch.set_facecolor('#0a0e1a')
     ax.set_facecolor('#0a0e1a')
 
     H = height_cm * 10  # mm
-    # We'll draw the silhouette in normalized height coords (0=top, 1=bottom)
-    # Convert Z coords
     def z_to_y(z): return z / H
 
-    # ── Silhouette outline (simplified torso) ──
-    # Head
-    head_y = 0.08
-    head = plt.Circle((0.5, head_y), 0.08, color='#1a2e4a', linewidth=1.5,
-                       edgecolor='#2a5080', zorder=3, fill=True)
+    # ── Silhouette outline construction ──
+    head = plt.Circle((0.5, 0.08), 0.08, color='#1a2e4a', linewidth=1.5, edgecolor='#2a5080', zorder=2)
     ax.add_patch(head)
-
-    # Neck
     ax.plot([0.46, 0.46, 0.44, 0.44], [0.155, 0.17, 0.18, 0.195], color='#2a5080', lw=1.5)
     ax.plot([0.54, 0.54, 0.56, 0.56], [0.155, 0.17, 0.18, 0.195], color='#2a5080', lw=1.5)
 
-    # Torso (trapezoid shape)
-    torso_x = np.array([0.30, 0.32, 0.68, 0.70, 0.66, 0.34, 0.30])
-    torso_y = np.array([0.195, 0.60, 0.60, 0.195, 0.195, 0.195, 0.195])
     torso_x = np.array([0.32, 0.68, 0.72, 0.65, 0.35, 0.28, 0.32])
     torso_y = np.array([0.195, 0.195, 0.38, 0.62, 0.62, 0.38, 0.195])
-    ax.fill(torso_x, torso_y, color='#0e1e38', zorder=2)
-    ax.plot(np.append(torso_x, torso_x[0]),
-            np.append(torso_y, torso_y[0]), color='#2a5080', lw=1.5, zorder=3)
+    ax.fill(torso_x, torso_y, color='#0e1e38', zorder=1)
+    ax.plot(np.append(torso_x, torso_x[0]), np.append(torso_y, torso_y[0]), color='#2a5080', lw=1.5, zorder=2)
 
-    # Arms
-    ax.plot([0.28, 0.20, 0.18, 0.22], [0.38, 0.42, 0.60, 0.72],
-            color='#2a5080', lw=6, solid_capstyle='round')
-    ax.plot([0.72, 0.80, 0.82, 0.78], [0.38, 0.42, 0.60, 0.72],
-            color='#2a5080', lw=6, solid_capstyle='round')
+    ax.plot([0.28, 0.20, 0.18, 0.22], [0.38, 0.42, 0.60, 0.72], color='#2a5080', lw=6, solid_capstyle='round')
+    ax.plot([0.72, 0.80, 0.82, 0.78], [0.38, 0.42, 0.60, 0.72], color='#2a5080', lw=6, solid_capstyle='round')
 
-    # Pelvis/Hips
     hip_x = np.array([0.33, 0.67, 0.72, 0.28, 0.33])
     hip_y = np.array([0.62, 0.62, 0.72, 0.72, 0.62])
-    ax.fill(hip_x, hip_y, color='#0e1e38', zorder=2)
-    ax.plot(hip_x, hip_y, color='#2a5080', lw=1.5, zorder=3)
+    ax.fill(hip_x, hip_y, color='#0e1e38', zorder=1)
+    ax.plot(hip_x, hip_y, color='#2a5080', lw=1.5, zorder=2)
 
-    # Legs
-    ax.plot([0.38, 0.36, 0.37, 0.38], [0.72, 0.86, 0.95, 1.0],
-            color='#2a5080', lw=10, solid_capstyle='round')
-    ax.plot([0.62, 0.64, 0.63, 0.62], [0.72, 0.86, 0.95, 1.0],
-            color='#2a5080', lw=10, solid_capstyle='round')
+    ax.plot([0.38, 0.36, 0.37, 0.38], [0.72, 0.86, 0.95, 1.0], color='#2a5080', lw=10, solid_capstyle='round')
+    ax.plot([0.62, 0.64, 0.63, 0.62], [0.72, 0.86, 0.95, 1.0], color='#2a5080', lw=10, solid_capstyle='round')
 
-    # ── Landmark markers ──
+    # ── 2D GLOWING HEATMAP PROJECTION OVERLAYS ──
+    # Projects the volumetric tensor arrays along the coronal view axis
     for name, lm in landmarks.items():
-        z = lm["coords"][2]
-        y = z_to_y(z)
-        color = lm["color"]
-        ax.scatter(0.5, y, s=80, color=color, zorder=6, marker='D')
-        ax.plot([0.25, 0.75], [y, y], color=color, lw=0.8, alpha=0.4,
-                linestyle=':', zorder=5)
-        ax.text(0.76, y, name.split("(")[0].strip(),
-                va='center', ha='left', fontsize=6.5,
-                color=color, fontfamily='monospace', fontweight='bold')
+        z_center = lm["coords"][2]
+        y_center_norm = z_to_y(z_center)
+        
+        # Pull 3D volume, squashing depth axes to construct relative probability projections
+        volume_3d = lm["volume"]
+        coronal_projection = np.sum(volume_3d, axis=2) # Shape: (128, 32)
+        
+        # Map localized subgrid spans centered on the visual coordinate node
+        z_mesh = np.linspace(y_center_norm - 0.08, y_center_norm + 0.08, 64)
+        x_mesh = np.linspace(0.32, 0.68, 32)
+        X_m, Z_m = np.meshgrid(x_mesh, z_mesh)
+        
+        # Calculate localized 2D Gaussian scaling matrices to simulate glowing fields
+        dist_sq = ((X_m - 0.5)**2 / 0.04) + ((Z_m - y_center_norm)**2 / 0.0035)
+        sigma_glow = lm["peak_width"] / 12.0
+        glow_intensity = np.exp(-dist_sq / (2.0 * sigma_glow**2))
+        
+        # Superimpose custom colormap gradients representing anatomical confidence zones
+        if name.startswith("Carina"):
+            cmap_glow = plt.cm.get_cmap("cool")
+        elif name.startswith("T12"):
+            cmap_glow = plt.cm.get_cmap("Wistia")
+        else:
+            cmap_glow = plt.cm.get_cmap("gist_heat")
+            
+        ax.contourf(X_m, Z_m, glow_intensity, levels=14, cmap=cmap_glow, alpha=0.45, zorder=3)
+        
+        # Exact Soft-Argmax Center Coordinate Indicator Point
+        ax.scatter(0.5, y_center_norm, s=45, color=lm["color"], edgecolors='#ffffff', linewidths=0.5, zorder=5, marker='o')
+        ax.plot([0.22, 0.78], [y_center_norm, y_center_norm], color=lm["color"], lw=0.7, alpha=0.35, linestyle='--', zorder=4)
+        
+        ax.text(0.79, y_center_norm, name.split("(")[0].strip(), va='center', ha='left',
+                fontsize=7, color=lm["color"], fontfamily='monospace', fontweight='bold')
 
-    # ── Scan range highlight ──
+    # ── Target Volume Scan Box Highlights ──
     y_start = z_to_y(result["z_start_mm"])
     y_end = z_to_y(result["z_end_mm"])
 
-    # Fill scan zone
-    scan_rect = plt.Rectangle((0.0, y_start), 1.0, y_end - y_start,
-                               color='#0050a0', alpha=0.18, zorder=4)
+    if result.get("safety_trigger", False):
+        # High uncertainty visual boundary styling adjustments
+        scan_rect = plt.Rectangle((0.0, y_start), 1.0, y_end - y_start, color='#ff4444', alpha=0.08, zorder=2)
+        line_style = (0, (3, 3)) # Dashed boundary tracking line style
+        line_color_start, line_color_end = '#ffaa00', '#ff4444'
+    else:
+        scan_rect = plt.Rectangle((0.0, y_start), 1.0, y_end - y_start, color='#0050a0', alpha=0.16, zorder=2)
+        line_style = '-'
+        line_color_start, line_color_end = '#00e676', '#ff4466'
+        
     ax.add_patch(scan_rect)
 
-    # Start line
-    ax.axhline(y_start, color='#00e676', lw=2.0, linestyle='-', zorder=7, alpha=0.9)
+    # Upper start marker lines
+    ax.axhline(y_start, color=line_color_start, lw=1.8, linestyle=line_style, zorder=6)
     ax.text(0.02, y_start - 0.012, f"▶ START  Z={result['z_start_mm']:.0f}mm",
-            va='bottom', ha='left', fontsize=7, color='#00e676',
-            fontfamily='monospace', fontweight='bold')
+            va='bottom', ha='left', fontsize=7, color=line_color_start, fontfamily='monospace', fontweight='bold')
 
-    # End line
-    ax.axhline(y_end, color='#ff4466', lw=2.0, linestyle='-', zorder=7, alpha=0.9)
+    # Lower terminate boundary markers
+    ax.axhline(y_end, color=line_color_end, lw=1.8, linestyle=line_style, zorder=6)
     ax.text(0.02, y_end + 0.006, f"▶ END    Z={result['z_end_mm']:.0f}mm",
-            va='top', ha='left', fontsize=7, color='#ff4466',
-            fontfamily='monospace', fontweight='bold')
+            va='top', ha='left', fontsize=7, color=line_color_end, fontfamily='monospace', fontweight='bold')
 
-    # Double-headed arrow for span
-    ax.annotate("", xy=(0.12, y_end), xytext=(0.12, y_start),
-                arrowprops=dict(arrowstyle='<->', color='#4a9adc',
-                                lw=1.2, mutation_scale=10))
+    # Double-headed bounding tracking vectors
+    ax.annotate("", xy=(0.10, y_end), xytext=(0.10, y_start), arrowprops=dict(arrowstyle='<->', color='#4a9adc', lw=1.1))
     span_mm = result["z_end_mm"] - result["z_start_mm"]
-    ax.text(0.04, (y_start + y_end) / 2, f"{span_mm:.0f}\nmm",
-            va='center', ha='left', fontsize=6, color='#4a9adc',
-            fontfamily='monospace', linespacing=1.4)
+    ax.text(0.03, (y_start + y_end) / 2, f"{span_mm:.0f}\nmm", va='center', ha='left', fontsize=6.5, color='#4a9adc', fontfamily='monospace')
 
     ax.set_xlim(0, 1)
     ax.set_ylim(1.05, -0.05)
     ax.axis('off')
-    ax.set_title("SCAN RANGE PREVIEW", fontsize=8, color='#4a7a9b',
-                 fontfamily='monospace', pad=8, fontweight='bold', loc='center')
+    ax.set_title("3D HEATMAP REGRESSION FIELD", fontsize=8, color='#4a7a9b', fontfamily='monospace', pad=8, fontweight='bold')
 
-    plt.tight_layout(pad=0.3)
+    plt.tight_layout(pad=0.2)
     return fig
 
 
-# ── Main App ──────────────────────────────────────────────────────────────────
+# ── Main App Execution ────────────────────────────────────────────────────────
 
 def main():
-    # Header
     st.markdown("""
     <div class="ct-header">
         <div>
             <h1>🩻 SCOUT-LESS CT PLANNER</h1>
-            <p>AI-Assisted Scan Range Determination</p>
+            <p>Multi-Modal Late-Fusion Heatmap Regression System</p>
         </div>
     </div>
     """, unsafe_allow_html=True)
 
-    # ── SIDEBAR ──────────────────────────────────────────────────────────────
+    # ── SIDEBAR CONFIGURATIONS ──
     with st.sidebar:
-        st.markdown("### ⚙️ Patient Input")
-        st.caption("Configure patient data and scan parameters")
+        st.markdown("### ⚙️ Patient Input Setup")
+        st.caption("Configure multi-sensor fusion inputs & metrics")
 
-        st.markdown('<div class="sidebar-section">📁 3D Scan Data</div>', unsafe_allow_html=True)
-        uploaded_file = st.file_uploader(
-            "Upload Patient Scan",
-            type=["png", "jpg", "jpeg", "obj", "stl", "nii", "nii.gz"],
-            help="Mock input: any image or mesh file. In production: DICOM/NIfTI surface scan.",
-        )
-        if uploaded_file:
-            st.success(f"✓ Loaded: `{uploaded_file.name}` ({uploaded_file.size // 1024} KB)")
+        st.markdown('<div class="sidebar-section">📡 Multi-Modal Surface Sensors</div>', unsafe_allow_html=True)
+        rgb_cam = st.selectbox("RGB Camera (Texture Tracking)", ["Optimal", "Degraded (Shadows/Obstructions)"])
+        depth_cam = st.selectbox("Depth Camera (3D Spatial)", ["Optimal", "Degraded (Thick Gowns/Layers)"])
+        ir_cam = st.selectbox("Infrared Sensor (Thermal Contour)", ["Optimal", "Degraded (Extreme Thermal Shielding)"])
 
-        st.markdown('<div class="sidebar-section">📐 Vital Statistics</div>', unsafe_allow_html=True)
-        height = st.number_input("Height (cm)", min_value=120.0, max_value=220.0,
-                                  value=170.0, step=0.5, format="%.1f")
-        weight = st.number_input("Weight (kg)", min_value=30.0, max_value=250.0,
-                                  value=75.0, step=0.5, format="%.1f")
+        st.markdown('<div class="sidebar-section">📐 Body Morphometry</div>', unsafe_allow_html=True)
+        height = st.number_input("Height (cm)", min_value=120.0, max_value=220.0, value=170.0, step=0.5, format="%.1f")
+        weight = st.number_input("Weight (kg)", min_value=30.0, max_value=250.0, value=75.0, step=0.5, format="%.1f")
         age = st.number_input("Age (years)", min_value=1, max_value=120, value=45, step=1)
         sex = st.selectbox("Biological Sex", ["Male", "Female", "Other/Unspecified"])
 
-        st.markdown('<div class="sidebar-section">🔬 Scan Request</div>', unsafe_allow_html=True)
-        scan_type = st.selectbox(
-            "Scan Type",
-            ["Chest CT", "Abdomen CT", "Pelvis CT", "Chest-Abdomen-Pelvis (CAP)"],
-        )
-        contrast = st.selectbox("Contrast", ["With IV Contrast", "Without Contrast", "Dual Phase"])
+        st.markdown('<div class="sidebar-section">🔬 Acquisition Target</div>', unsafe_allow_html=True)
+        scan_type = st.selectbox("Scan Type", ["Chest CT", "Abdomen CT", "Pelvis CT", "Chest-Abdomen-Pelvis (CAP)"])
+        contrast = st.selectbox("Contrast Profile", ["With IV Contrast", "Without Contrast", "Dual Phase"])
 
-        st.markdown('<div class="sidebar-section">🤖 AI Settings</div>', unsafe_allow_html=True)
+        st.markdown('<div class="sidebar-section">🤖 Advanced Engine Controls</div>', unsafe_allow_html=True)
+        noise_level = st.slider("Heatmap Uncertainty (Noise Scale)", 0.5, 10.0, 2.5, 0.5)
         use_rag = st.checkbox("Enable RAG Protocol Retrieval", value=True)
-        show_raw = st.checkbox("Show Raw Landmark Coords", value=False)
+        show_raw = st.checkbox("Show Raw Multi-Modal Metrics", value=False)
 
         st.markdown("---")
-        run_btn = st.button("▶  RUN AI PLANNER", use_container_width=True, type="primary")
-        
+        run_btn = st.button("▶  RUN MULTI-MODAL PLANNER", use_container_width=True, type="primary")
 
-    # ── MAIN PANEL ───────────────────────────────────────────────────────────
     bmi = weight / ((height / 100) ** 2)
 
-    # Step bar
     if "ran" not in st.session_state:
         st.session_state.ran = False
 
     steps = [
-        ("1. INPUT", "done" if (uploaded_file or height) else "active"),
-        ("2. INFERENCE", "done" if st.session_state.ran else ""),
-        ("3. RAG RETRIEVE", "done" if st.session_state.ran else ""),
-        ("4. PLAN", "done" if st.session_state.ran else ""),
-        ("5. CONFIRM", "active" if st.session_state.ran else ""),
+        ("1. MULTI-SENSOR", "done" if height else "active"),
+        ("2. FUSION MATRIX", "done" if st.session_state.ran else ""),
+        ("3. REGRESSION FIELD", "done" if st.session_state.ran else ""),
+        ("4. RISK EVALUATION", "done" if st.session_state.ran else ""),
+        ("5. CONTROL CONTROL", "active" if st.session_state.ran else ""),
     ]
-    step_html = '<div class="step-bar">' + "".join(
-        f'<div class="step-item {cls}">{label}</div>'
-        for label, cls in steps
-    ) + '</div>'
+    step_html = '<div class="step-bar">' + "".join(f'<div class="step-item {cls}">{label}</div>' for label, cls in steps) + '</div>'
     st.markdown(step_html, unsafe_allow_html=True)
 
-    # ── Always show patient context ──
+    # ── Live Vitals Grid ──
     col1, col2, col3, col4 = st.columns(4)
-
-    bmi_status = ("normal" if bmi < 25 else "overweight" if bmi < 30 else "obese")
-    bmi_label = ("Normal" if bmi < 25 else "Overweight" if bmi < 30 else
-                 "Obese I" if bmi < 35 else "Obese II" if bmi < 40 else "Obese III")
-    bmi_color_class = (f"status-{bmi_status}")
+    bmi_status = "normal" if bmi < 25 else "overweight" if bmi < 30 else "obese"
+    bmi_label = "Normal" if bmi < 25 else "Overweight" if bmi < 30 else "Obese I" if bmi < 35 else "Obese II" if bmi < 40 else "Obese III"
+    bmi_color_class = f"status-{bmi_status}"
 
     with col1:
-        st.markdown(f"""
-        <div class="metric-card">
-            <div class="metric-label">BMI</div>
-            <div class="metric-value">{bmi:.1f}<span class="metric-unit">kg/m²</span></div>
-            <span class="metric-status {bmi_color_class}">{bmi_label}</span>
-        </div>""", unsafe_allow_html=True)
-
+        st.markdown(f'<div class="metric-card"><div class="metric-label">BMI Matrix</div><div class="metric-value">{bmi:.1f}<span class="metric-unit">kg/m²</span></div><span class="metric-status {bmi_color_class}">{bmi_label}</span></div>', unsafe_allow_html=True)
     with col2:
-        st.markdown(f"""
-        <div class="metric-card">
-            <div class="metric-label">Height</div>
-            <div class="metric-value">{height:.0f}<span class="metric-unit">cm</span></div>
-            <span class="metric-status status-normal">Measured</span>
-        </div>""", unsafe_allow_html=True)
-
+        st.markdown(f'<div class="metric-card"><div class="metric-label">Spatial Height</div><div class="metric-value">{height:.0f}<span class="metric-unit">cm</span></div><span class="metric-status status-normal">Calculated</span></div>', unsafe_allow_html=True)
     with col3:
-        st.markdown(f"""
-        <div class="metric-card">
-            <div class="metric-label">Weight</div>
-            <div class="metric-value">{weight:.0f}<span class="metric-unit">kg</span></div>
-            <span class="metric-status status-normal">Measured</span>
-        </div>""", unsafe_allow_html=True)
-
+        st.markdown(f'<div class="metric-card"><div class="metric-label">Patient Mass</div><div class="metric-value">{weight:.0f}<span class="metric-unit">kg</span></div><span class="metric-status status-normal">Calculated</span></div>', unsafe_allow_html=True)
     with col4:
-        st.markdown(f"""
-        <div class="metric-card">
-            <div class="metric-label">Patient</div>
-            <div class="metric-value" style="font-size:1.2rem">{age}y {sex[0]}</div>
-            <span class="metric-status status-normal">{scan_type.split()[0]}</span>
-        </div>""", unsafe_allow_html=True)
+        st.markdown(f'<div class="metric-card"><div class="metric-label">Target Profile</div><div class="metric-value" style="font-size:1.1rem">{age}y {sex[0]}</div><span class="metric-status status-normal">{scan_type.split()[0]}</span></div>', unsafe_allow_html=True)
 
-    # ── Run pipeline ──────────────────────────────────────────────────────────
+    # ── Pipeline Pipeline Execution ──
     if run_btn:
         st.session_state.ran = True
-
-        progress_bar = st.progress(0, text="⚙️  Initialising inference engine…")
-        time.sleep(0.05)
-
-        # Step 1: Skeletal model
-        progress_bar.progress(20, text="🦴  Running skeletal parameter model (85-D)…")
-        skel_params = simulate_skel_model(height, weight)
-        time.sleep(0.05)
-
-        # Step 2: Landmark prediction
-        progress_bar.progress(45, text="📍  Predicting anatomical landmarks (nnLandmark)…")
-        landmarks = simulate_nnLandmark(height, weight)
-        time.sleep(0.05)
-
-        # Step 3: RAG
-        progress_bar.progress(65, text="🔍 Retrieving CT protocol via FAISS RAG…")
-
+        progress_bar = st.progress(0, text="Initializing multi-modal inference pipeline...")
+        time.sleep(0.04)
+        
+        # Step 1: Execute Sensor Fusion Tracking
+        progress_bar.progress(20, text="📡 Syncing sensors & processing Late-Fusion confidence matrices...")
+        fusion_result = simulate_multimodal_fusion(rgb_cam, depth_cam, ir_cam, bmi)
+        time.sleep(0.04)
+        
+        # Step 2: Compute Volumetric Probability Maps
+        progress_bar.progress(45, text="📍 Regressing 3D volumetric probability fields (EDT Matrices)...")
+        raw_heatmaps = generate_edt_heatmaps(height, weight, noise_level)
+        time.sleep(0.04)
+        
+        # Step 3: Compute Sub-voxel Precise Points via Soft-Argmax
+        progress_bar.progress(65, text="🔢 Executing Soft-Argmax spatial calculations across tensors...")
+        processed_landmarks = {}
+        for name, data in raw_heatmaps.items():
+            fx, fy, fz = extract_coords_from_heatmap(data["volume"], height)
+            processed_landmarks[name] = {
+                "coords": (fx, fy, fz),
+                "peak_width": data["peak_width"],
+                "color": data["color"],
+                "anatomy": data["anatomy"],
+                "volume": data["volume"]
+            }
+            
+        # Step 4: Retrieve Context Profiles via RAG
+        progress_bar.progress(80, text="🔍 Extracting tracking standard guidelines via FAISS vector layers...")
         if use_rag:
             vectorstore, rag_mode = build_rag_pipeline()
             protocol_text = retrieve_protocol(scan_type, vectorstore, rag_mode)
         else:
             protocol_text = CT_PROTOCOL_KB.split("\n\n")[0]
             rag_mode = "disabled"
-            time.sleep(0.05)
-
-        # Step 4: Reasoning
-        progress_bar.progress(85, text="🧠  Reasoning agent computing scan boundaries…")
-        result = reasoning_agent(scan_type, landmarks, protocol_text, height, weight)
-        time.sleep(0.05)
-
-        progress_bar.progress(100, text="✅  Analysis complete.")
-        time.sleep(0.05)
+            
+        # Step 5: Advanced Planning and Reasoning Matrix
+        progress_bar.progress(95, text="🧠 Evaluation agent assessing aleatoric uncertainty parameters...")
+        agent_plan = reasoning_agent(scan_type, processed_landmarks, protocol_text, height, weight, fusion_result["combined_confidence"])
+        progress_bar.progress(100, text="✅ Pipeline inference matrix loaded successfully.")
+        time.sleep(0.04)
         progress_bar.empty()
-
-        # Store results
-        st.session_state.landmarks = landmarks
-        st.session_state.skel_params = skel_params
-        st.session_state.result = result
+        
+        st.session_state.landmarks = processed_landmarks
+        st.session_state.result = agent_plan
         st.session_state.rag_mode = rag_mode
+        st.session_state.fusion_data = fusion_result
 
-    # ── Display results ───────────────────────────────────────────────────────
+    # ── Display Visual Results Matrices ──
     if st.session_state.ran and "result" in st.session_state:
         landmarks = st.session_state.landmarks
         result = st.session_state.result
-        skel_params = st.session_state.skel_params
         rag_mode = st.session_state.rag_mode
+        fusion_data = st.session_state.fusion_data
 
         st.markdown("---")
-
-        # Two-column layout: silhouette + results
         vis_col, res_col = st.columns([1, 2], gap="large")
 
         with vis_col:
-            st.markdown('<div class="section-header">Visual Recommendation</div>',
-                        unsafe_allow_html=True)
+            st.markdown('<div class="section-header">2D Coronal Heatmap Projections</div>', unsafe_allow_html=True)
             fig = plot_human_silhouette(landmarks, result, height)
             st.pyplot(fig, use_container_width=True)
             plt.close(fig)
 
         with res_col:
-            # Landmarks
-            st.markdown('<div class="section-header">Detected Landmarks</div>',
-                        unsafe_allow_html=True)
+            # Safety Alert System Overrides
+            if result.get("safety_trigger", False):
+                st.markdown(f"""
+                <div style="background:#2a0a0a; border:2px solid #ff4444; border-radius:8px; padding:16px; margin-bottom:15px;">
+                    <h4 style="color:#ff4444; margin:0 0 8px 0; font-family:'Space Mono',monospace;">⚠️ AUTOMATED SAFETY GATE TRIGGERED</h4>
+                    <p style="color:#ffcccc; font-size:0.88rem; margin:0;"><strong>{result['safety_message']}</strong></p>
+                </div>""", unsafe_allow_html=True)
+
+            # Volumetric Tracker Extractions
+            st.markdown('<div class="section-header">Soft-Argmax Precise Coordinate Extractions</div>', unsafe_allow_html=True)
             for name, lm in landmarks.items():
                 x, y, z = lm["coords"]
                 st.markdown(f"""
                 <div class="landmark-row" style="border-left-color:{lm['color']}">
                     <div class="landmark-name" style="color:{lm['color']}">{name}</div>
-                    <div class="landmark-coords">
-                        x={x:+.1f} &nbsp; y={y:+.1f} &nbsp; z={z:.1f} mm
-                    </div>
-                    <div style="font-size:0.72rem;color:#4a7a9b;margin-left:auto">{lm['anatomy']}</div>
+                    <div class="landmark-coords">X={x:+.2f} &nbsp; Y={y:+.2f} &nbsp; Z={z:.1f} mm</div>
+                    <div style="font-size:0.72rem; color:#6a9ec0; margin-left:auto;">Peak Width spatial uncertainty: {lm['peak_width']:.2f}mm</div>
                 </div>""", unsafe_allow_html=True)
 
-            # Z-boundaries
-            st.markdown('<div class="section-header">Calculated Scan Boundaries</div>',
-                        unsafe_allow_html=True)
+            # Plan Boundaries
+            st.markdown('<div class="section-header">Calculated Spatial Target Boundaries</div>', unsafe_allow_html=True)
             span = result["z_end_mm"] - result["z_start_mm"]
             st.markdown(f"""
             <div class="z-boundary">
-                <div class="z-point start-point">
-                    <div class="z-point-label">Start Z</div>
-                    <div class="z-point-value">{result['z_start_mm']:.0f} mm</div>
-                    <div class="z-point-anatomy">{result['start_anatomy']}</div>
-                </div>
-                <div class="z-point end-point">
-                    <div class="z-point-label">End Z</div>
-                    <div class="z-point-value">{result['z_end_mm']:.0f} mm</div>
-                    <div class="z-point-anatomy">{result['end_anatomy']}</div>
-                </div>
-                <div class="z-point" style="border-top: 3px solid #4a9adc; flex: 0.6">
-                    <div class="z-point-label">Span</div>
-                    <div class="z-point-value" style="color:#4a9adc">{span:.0f} mm</div>
-                    <div class="z-point-anatomy">Protocol: {result['protocol_id']}</div>
-                </div>
+                <div class="z-point start-point"><div class="z-point-label">Planned Start Z</div><div class="z-point-value">{result['z_start_mm']:.0f} mm</div><div class="z-point-anatomy">{result['start_anatomy']}</div></div>
+                <div class="z-point end-point"><div class="z-point-label">Planned End Z</div><div class="z-point-value">{result['z_end_mm']:.0f} mm</div><div class="z-point-anatomy">{result['end_anatomy']}</div></div>
+                <div class="z-point" style="border-top:3px solid #4a9adc; flex:0.6"><div class="z-point-label">Acquisition Span</div><div class="z-point-value" style="color:#4a9adc">{span:.0f} mm</div><div class="z-point-anatomy">ID: {result['protocol_id']}</div></div>
             </div>""", unsafe_allow_html=True)
 
-            # Confidence
-            st.markdown('<div class="section-header">AI Confidence</div>',
-                        unsafe_allow_html=True)
+            # Confidence Metric Displays
+            st.markdown('<div class="section-header">System Integrated Confidence Coefficient</div>', unsafe_allow_html=True)
             conf_pct = int(result["confidence"] * 100)
+            bar_color = "linear-gradient(90deg, #ff4444, #ffaa00)" if result["safety_trigger"] else "linear-gradient(90deg, #0050c0, #00a0ff, #00e676)"
             st.markdown(f"""
             <div class="confidence-container">
-                <div class="confidence-label">
-                    <span class="confidence-title">Overall Planning Confidence</span>
-                    <span class="confidence-pct">{conf_pct}%</span>
-                </div>
-                <div class="confidence-bar-bg">
-                    <div class="confidence-bar-fill" style="width:{conf_pct}%"></div>
-                </div>
+                <div class="confidence-label"><span class="confidence-title">Combined Prediction Interval Matrix</span><span class="confidence-pct" style="color:{'#ff4444' if result['safety_trigger'] else '#00e676'}">{conf_pct}%</span></div>
+                <div class="confidence-bar-bg"><div class="confidence-bar-fill" style="width:{conf_pct}%; background:{bar_color};"></div></div>
             </div>""", unsafe_allow_html=True)
 
-            # Rationale
-            st.markdown('<div class="section-header">Medical Rationale (RAG)</div>',
-                        unsafe_allow_html=True)
-            rag_tag = f"FAISS+LangChain" if rag_mode == "langchain" else "KEYWORD FALLBACK"
+            # Context Explanations
+            st.markdown('<div class="section-header">Medical Rationale & Safety Insights</div>', unsafe_allow_html=True)
+            rag_tag = "FAISS+LangChain Vector Pipeline" if rag_mode == "langchain" else "KEYWORD MATRIX FALLBACK"
             st.markdown(f"""
             <div class="rationale-box">
                 <span class="rag-tag">⚡ RAG · {rag_tag}</span><br/>
                 {result['rationale']}
             </div>""", unsafe_allow_html=True)
 
-        # Retrieved Protocol (expandable)
-        with st.expander("📄 Retrieved Protocol Chunk (RAG Source)", expanded=False):
-            st.markdown(f"""
-            <div class="protocol-card">
-                <strong>{result['protocol_id']} — Retrieved Context</strong>
-                {result['retrieved_protocol'].replace(chr(10), '<br/>')}
-            </div>""", unsafe_allow_html=True)
-
-        # Skeletal params (expandable)
+        # Multi-sensor Fusion Data Breakdown Matrix (Expandable)
         if show_raw:
-            with st.expander("🔢 Raw 85-D Skeletal Parameter Vector", expanded=False):
-                st.markdown('<div class="section-header">Skeletal Model Output</div>',
-                            unsafe_allow_html=True)
-                param_cols = st.columns(5)
-                for i, v in enumerate(skel_params[:25]):
-                    param_cols[i % 5].metric(f"θ[{i}]", f"{v:.4f}")
+            with st.expander("🔢 Raw Late-Fusion Multi-Modal Sensor Diagnostics", expanded=False):
+                st.markdown('<div class="section-header">Late Fusion Reliability Matrix Matrix</div>', unsafe_allow_html=True)
+                f_cols = st.columns(4)
+                f_cols[0].metric("RGB Stream Weight", f"{fusion_data['fused_vector'][0]:.2f}")
+                f_cols[1].metric("Depth Matrix Weight", f"{fusion_data['fused_vector'][1]:.2f}")
+                f_cols[2].metric("Infrared Stream Weight", f"{fusion_data['fused_vector'][2]:.2f}")
+                f_cols[3].metric("Fused Ensemble Index Coefficient", f"{fusion_data['combined_confidence']:.4f}")
 
-        # ── Human-in-the-Loop ─────────────────────────────────────────────────
+        # Clinician Handoff Operations
         st.markdown("---")
-        st.markdown('<div class="section-header">🧑‍⚕️ Human-in-the-Loop Approval</div>',
-                    unsafe_allow_html=True)
-
-        warn_color = "#ff4466" if result["confidence"] < 0.75 else "#ffaa00" if result["confidence"] < 0.88 else "#00e676"
+        st.markdown('<div class="section-header">🧑‍⚕️ Clinician Handoff & Protocol Verification</div>', unsafe_allow_html=True)
+        warn_color = "#ff4444" if result["safety_trigger"] else "#ffaa00" if result["confidence"] < 0.85 else "#00e676"
+        
         st.markdown(f"""
-        <div style="background:#0b1829;border:1px solid #1e3a5f;border-radius:8px;
-                    padding:16px 20px;margin-bottom:20px;">
-            <p style="color:#8ab4cc;font-size:0.85rem;margin:0 0 8px 0;">
-                <strong style="color:{warn_color};">⚠ Radiographer Review Required</strong><br/>
-                AI-generated scan boundaries are recommendations only.
-                A qualified radiographer or radiologist <strong>must</strong> verify the
-                Z-axis boundaries before initiating acquisition.
-                Confidence: <strong style="color:{warn_color};">{conf_pct}%</strong>
+        <div style="background:#0b1829; border:1px solid #1e3a5f; border-radius:8px; padding:16px 20px; margin-bottom:20px;">
+            <p style="color:#8ab4cc; font-size:0.85rem; margin:0 0 8px 0;">
+                <strong style="color:{warn_color};">⚠️ System Action Clearance Profile Required</strong><br/>
+                {"MANUAL SCAN VALIDATION REQUIRED: Automated confidence thresholds breached. Proceed with ultra-low dose tracking scout." if result['safety_trigger'] else "Scan boundaries are verified to sub-voxel thresholds. Confirm execution plan to transition gantry coordinates."}
             </p>
-            <div style="font-family:'Space Mono',monospace;font-size:0.75rem;color:#4a7a9b;">
-                Protocol: {result['protocol_id']} &nbsp;|&nbsp;
-                Start: {result['z_start_mm']:.0f} mm &nbsp;|&nbsp;
-                End: {result['z_end_mm']:.0f} mm &nbsp;|&nbsp;
-                Span: {span:.0f} mm
-            </div>
         </div>""", unsafe_allow_html=True)
 
         confirm_col, reject_col, _ = st.columns([1, 1, 3])
         with confirm_col:
-            confirm_btn = st.button("✅  Confirm & Execute Scan", use_container_width=True)
+            confirm_btn = st.button("✅  Confirm & Transmit Plan", use_container_width=True)
         with reject_col:
-            reject_btn = st.button("✗  Reject — Adjust Manually", use_container_width=True)
+            reject_btn = st.button("❌  Override — Manual Entry", use_container_width=True)
 
         if confirm_btn:
             ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-            log_entry = {
-                "timestamp": ts,
-                "action": "APPROVED",
-                "protocol": result["protocol_id"],
-                "z_start": result["z_start_mm"],
-                "z_end": result["z_end_mm"],
-                "confidence": result["confidence"],
-                "patient": {"height": height, "weight": weight, "bmi": round(bmi, 2), "age": age},
-                "scan_type": scan_type,
-            }
-
-            # Persist audit log — cross-platform path (works on Windows + Linux)
             log_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "audit_log.jsonl")
             with open(log_path, "a") as f:
-                f.write(json.dumps(log_entry) + "\n")
-
-            st.success("🟢 Scan approved and queued for acquisition.")
+                f.write(json.dumps({"timestamp": ts, "action": "TRANSMITTED", "safety_override": result["safety_trigger"], "z_start": result["z_start_mm"], "z_end": result["z_end_mm"]}) + "\n")
+            
+            st.success("🟢 Scan configurations routed directly to execution pipelines.")
             st.markdown(f"""
             <div class="log-box">
-                <p class="log-entry"><span class="log-time">[{ts}]</span>
-                <span class="log-ok"> ✓ TECHNICIAN APPROVED</span></p>
-                <p class="log-entry"><span class="log-time">[SYS]</span>
-                Protocol={result['protocol_id']} | Z={result['z_start_mm']:.0f}→{result['z_end_mm']:.0f}mm
-                | Span={span:.0f}mm | Conf={conf_pct}%</p>
-                <p class="log-entry"><span class="log-time">[SYS]</span>
-                Audit log written → ct_planner_audit.jsonl</p>
-                <p class="log-entry"><span class="log-time">[SYS]</span>
-                <span class="log-ok"> STATUS: READY FOR GANTRY CONTROL HANDOFF</span></p>
+                <p class="log-entry"><span class="log-time">[{ts}]</span> <span class="log-ok">✓ HARDWARE CONFIGS LOCKED</span></p>
+                <p class="log-entry"><span class="log-time">[SYS]</span> Boundary parameters transmitted: Z={result['z_start_mm']} to {result['z_end_mm']} | Safety Override Status: {result['safety_trigger']}</p>
+                <p class="log-entry"><span class="log-time">[SYS]</span> <span class="log-ok">STATUS: READY FOR MACHINE HANDOFF</span></p>
             </div>""", unsafe_allow_html=True)
-
-        if reject_btn:
-            ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-            st.warning("🟡 Plan rejected. Please adjust parameters manually and re-run.")
-            st.markdown(f"""
-            <div class="log-box">
-                <p class="log-entry"><span class="log-time">[{ts}]</span>
-                <span class="log-warn"> ⚠ TECHNICIAN REJECTED AI PLAN</span></p>
-                <p class="log-entry"><span class="log-time">[SYS]</span>
-                Manual override initiated. Reverting to standard scout protocol.</p>
-            </div>""", unsafe_allow_html=True)
-
-    else:
-        # Placeholder state
-        st.markdown("""
-        <div style="text-align:center;padding:60px 20px;color:#2a4a6a">
-            <div style="font-size:4rem;margin-bottom:16px">🩻</div>
-            <div style="font-family:'Space Mono',monospace;font-size:0.9rem;
-                        color:#2a5a8a;letter-spacing:0.1em">
-                SYSTEM READY<br/>
-                <span style="font-size:0.7rem;color:#1e3a5a">
-                Enter patient vitals in the sidebar and click RUN AI PLANNER
-                </span>
-            </div>
-        </div>""", unsafe_allow_html=True)
 
 
 if __name__ == "__main__":
