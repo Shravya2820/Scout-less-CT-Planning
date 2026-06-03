@@ -507,6 +507,7 @@ def build_rag_pipeline():
     Falls back gracefully if LangChain/FAISS are not installed.
     """
     try:
+       
         from langchain_text_splitters import RecursiveCharacterTextSplitter
         from langchain_community.vectorstores import FAISS
         from langchain_huggingface import HuggingFaceEmbeddings
@@ -753,7 +754,7 @@ def main():
     <div class="ct-header">
         <div>
             <h1>🩻 SCOUT-LESS CT PLANNER</h1>
-            <p>AI-Assisted Scan Range Determination</p>
+            <p>AI-Assisted Scan Range Determination · B.Tech Prototype System</p>
         </div>
     </div>
     """, unsafe_allow_html=True)
