@@ -1,0 +1,30 @@
+# Scout-less CT Scan Planning System — Dependencies
+# Tested on Python 3.10 / 3.11
+
+# ── Core UI ──────────────────────────────────────────────────────────────────
+streamlit>=1.35.0
+
+# ── Numerical / Visualisation ─────────────────────────────────────────────────
+numpy>=1.26.0
+matplotlib>=3.8.0
+
+# ── LangChain RAG stack ───────────────────────────────────────────────────────
+langchain>=0.2.0
+langchain-community>=0.2.0
+langchain-core>=0.2.0
+
+# ── Vector store ─────────────────────────────────────────────────────────────
+faiss-cpu>=1.8.0
+
+# ── Embeddings (sentence-transformers/all-MiniLM-L6-v2) ──────────────────────
+sentence-transformers>=2.7.0
+# sentence-transformers requires torch; install CPU build to keep it lightweight:
+torch>=2.0.0
+transformers>=4.40.0
+huggingface-hub>=0.22.0
+tokenizers>=0.19.0
+
+# ── Optional: LLM backend (Llama 3 via Ollama) ───────────────────────────────
+# Uncomment if you want real LLM inference (requires Ollama running locally):
+# ollama>=0.2.0
+# langchain-ollama>=0.1.0
