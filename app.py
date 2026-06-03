@@ -502,6 +502,8 @@ def simulate_nnLandmark(height_cm: float, weight_kg: float) -> dict:
 
 @st.cache_resource(show_spinner=False)
 def build_rag_pipeline():
+
+
     """
     Build LangChain RAG pipeline with FAISS vector store.
     Falls back gracefully if LangChain/FAISS are not installed.
@@ -754,7 +756,7 @@ def main():
     <div class="ct-header">
         <div>
             <h1>🩻 SCOUT-LESS CT PLANNER</h1>
-            <p>AI-Assisted Scan Range Determination · B.Tech Prototype System</p>
+            <p>AI-Assisted Scan Range Determination</p>
         </div>
     </div>
     """, unsafe_allow_html=True)
@@ -794,6 +796,7 @@ def main():
 
         st.markdown("---")
         run_btn = st.button("▶  RUN AI PLANNER", use_container_width=True, type="primary")
+        
 
     # ── MAIN PANEL ───────────────────────────────────────────────────────────
     bmi = weight / ((height / 100) ** 2)
@@ -860,35 +863,36 @@ def main():
         st.session_state.ran = True
 
         progress_bar = st.progress(0, text="⚙️  Initialising inference engine…")
-        time.sleep(0.3)
+        time.sleep(0.05)
 
         # Step 1: Skeletal model
         progress_bar.progress(20, text="🦴  Running skeletal parameter model (85-D)…")
         skel_params = simulate_skel_model(height, weight)
-        time.sleep(0.4)
+        time.sleep(0.05)
 
         # Step 2: Landmark prediction
         progress_bar.progress(45, text="📍  Predicting anatomical landmarks (nnLandmark)…")
         landmarks = simulate_nnLandmark(height, weight)
-        time.sleep(0.4)
+        time.sleep(0.05)
 
         # Step 3: RAG
-        progress_bar.progress(65, text="🔍  Retrieving CT protocol via FAISS RAG…")
+        progress_bar.progress(65, text="🔍 Retrieving CT protocol via FAISS RAG…")
+
         if use_rag:
             vectorstore, rag_mode = build_rag_pipeline()
             protocol_text = retrieve_protocol(scan_type, vectorstore, rag_mode)
         else:
             protocol_text = CT_PROTOCOL_KB.split("\n\n")[0]
             rag_mode = "disabled"
-        time.sleep(0.4)
+            time.sleep(0.05)
 
         # Step 4: Reasoning
         progress_bar.progress(85, text="🧠  Reasoning agent computing scan boundaries…")
         result = reasoning_agent(scan_type, landmarks, protocol_text, height, weight)
-        time.sleep(0.3)
+        time.sleep(0.05)
 
         progress_bar.progress(100, text="✅  Analysis complete.")
-        time.sleep(0.4)
+        time.sleep(0.05)
         progress_bar.empty()
 
         # Store results
