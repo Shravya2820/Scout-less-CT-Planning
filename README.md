@@ -19,15 +19,6 @@ The **Scout-less CT Scan Planning System** replaces the physical pre-scan scout 
 ## 🏛️ System Architecture Diagram
 
 
-```
-
-```text
-Successfully written updated comprehensive README.md
-
-
-```
-
-```
              +-------------------------------------------------------------+
              |               MULTI-MODAL SURFACE SENSORS                   |
              |  [RGB Camera]          [Depth Camera]          [IR Camera]  |
@@ -74,10 +65,6 @@ Successfully written updated comprehensive README.md
              |    Dynamic anatomical silhouette adjusts to Sex/BMI. Maps   |
              |     glowing probability blobs & outputs locked gantry data. |
              +-------------------------------------------------------------+
-
-```
-
-```
 
 ---
 
