@@ -1,4 +1,4 @@
-"""# 🩻 Scout-less CT Scan Planning System
+# 🩻 Scout-less CT Scan Planning System
 ### Advanced Multi-Modal Late-Fusion & Volumetric Heatmap Regression Framework
 
 ---
