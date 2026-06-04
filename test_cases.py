@@ -1,28 +1,34 @@
 """
 Scout-less CT Scan Planner — Complete Test Suite
-Run: venv\Scripts\python.exe test_cases.py
+Run: venv\\Scripts\\python.exe test_cases.py or python3 test_cases.py
 """
 
 import sys
 import os
 import numpy as np
 
-# ── Import mock functions directly from app.py ────────────────────────────────
+# ── Ensure script root directory pathing compatibility ────────────────────────
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-# We replicate the three functions here so test_cases.py runs standalone
-# without needing Streamlit installed in the test environment.
+
+# ==============================================================================
+# 🧠 CORE MODEL & REASONING ENGINES
+# ==============================================================================
 
 def simulate_nnLandmark(height_cm, weight_kg):
+    """
+    Simulates sub-voxel coordinate regression using morphometric scaling parameters.
+    Replicated exactly to run standalone without requiring full system interface overhead.
+    """
     bmi = weight_kg / ((height_cm / 100) ** 2)
     H = height_cm * 10
 
-    # Indian NIOH-based constants (fixed)
+    # Indian NIOH-based anthropometric tracking constants
     sternum_z = H * 0.200
     t12_z     = H * 0.482
     pubis_z   = H * 0.771
 
-    # Capped BMI shift (fix for Bug 2 & 3)
+    # Bounded BMI shift calculation targeting soft-tissue structural displacement
     bmi_shift = float(np.clip((bmi - 22.0) * 1.2, -15.0, 30.0))
 
     lateral_spread = (bmi - 22) * 0.8
@@ -48,6 +54,9 @@ def simulate_nnLandmark(height_cm, weight_kg):
 
 
 def reasoning_agent(scan_type, landmarks, height, weight):
+    """
+    Evaluates landmarks and assigns physical hardware gantry boundaries with safety buffers.
+    """
     bmi = weight / ((height / 100) ** 2)
     sternum_z = landmarks["Sternum (Manubrium)"]["coords"][2]
     t12_z     = landmarks["T12 Vertebra"]["coords"][2]
@@ -66,7 +75,7 @@ def reasoning_agent(scan_type, landmarks, height, weight):
         z_start, z_end = pubis_z - 160, pubis_z + 25
         protocol_id = "PELVIS-001"
         conf = 0.85 - max(0, (bmi - 30) * 0.005)
-    else:  # CAP — full torso
+    else:  # CAP — full torso staging protocol
         z_start, z_end = sternum_z - 20, pubis_z + 10
         protocol_id = "CHEST-ABD-001"
         conf = 0.87 - max(0, (bmi - 30) * 0.009)
@@ -80,13 +89,15 @@ def reasoning_agent(scan_type, landmarks, height, weight):
     }
 
 
-# ── Expected span ranges per scan type (mm) ───────────────────────────────────
-# Upper bound scales with height: tallest patient (220cm) Chest span ~650mm is valid
+# ==============================================================================
+# 📊 TEST MATRICES AND EVALUATION CRITERIA
+# ==============================================================================
+
 EXPECTED_SPANS = {
     "Chest CT":                  (250, 700),
     "Abdomen CT":                (300, 700),
     "Pelvis CT":                 (150, 250),
-    "Chest-Abdomen-Pelvis (CAP)":(550, 1350),  # 220cm patient legitimately needs ~1300mm span
+    "Chest-Abdomen-Pelvis (CAP)":(550, 1350),
 }
 
 EXPECTED_CONF = {
@@ -105,8 +116,7 @@ def expected_conf_range(bmi):
     return (0.60, 0.97)
 
 
-# ── Test cases ────────────────────────────────────────────────────────────────
-
+# ── The Complete Catalog of Human Morphology Testing Rows ───────────────────
 ALL_TESTS = [
     # ── Category 1: Normal BMI Baselines ──
     ("CAT1", "Avg Indian Male",          165, 65,  "Chest CT"),
@@ -125,7 +135,7 @@ ALL_TESTS = [
     ("CAT2", "Obese III",                165, 110, "Chest-Abdomen-Pelvis (CAP)"),
     ("CAT2", "Morbidly Obese",           160, 140, "Abdomen CT"),
 
-    # ── Category 3: All Four Scan Types (same patient) ──
+    # ── Category 3: All Four Scan Types (same patient benchmark) ──
     ("CAT3", "Scan-Chest",               170, 75,  "Chest CT"),
     ("CAT3", "Scan-Abdomen",             170, 75,  "Abdomen CT"),
     ("CAT3", "Scan-Pelvis",              170, 75,  "Pelvis CT"),
@@ -161,21 +171,24 @@ ALL_TESTS = [
 ]
 
 
-# ── Runner ────────────────────────────────────────────────────────────────────
-
-PASS = "✅ PASS"
-FAIL = "❌ FAIL"
-WARN = "⚠️  WARN"
+# ==============================================================================
+# 🚀 CORE AUTOMATED RUNNER
+# ==============================================================================
 
 def run_tests():
     results = []
     failures = []
 
+    PASS = "✅ PASS"
+    FAIL = "❌ FAIL"
+    WARN = "⚠️  WARN"
+
     header = (f"{'Cat':<5} {'Label':<26} {'H':>4} {'W':>4} {'BMI':>5} "
               f"{'Z-St':>7} {'Z-End':>7} {'Span':>6} {'Conf':>5}  "
               f"{'SpanChk':<10} {'ConfChk':<10} {'ZOrder':<8}")
+    
     print("\n" + "=" * len(header))
-    print("  SCOUT-LESS CT PLANNER — FULL TEST SUITE")
+    print("  SCOUT-LESS CT PLANNER — COMPLETE ADAPTIVE MODEL SUITE")
     print("=" * len(header))
     print(header)
     print("-" * len(header))
@@ -191,14 +204,14 @@ def run_tests():
         span    = z_end - z_start
         conf    = r["confidence"]
 
-        # ── Checks ──
+        # ── Mathematical Range & Sequence Checks ──
         span_lo, span_hi = EXPECTED_SPANS[scan]
         span_ok  = PASS if span_lo <= span <= span_hi else FAIL
         conf_lo, conf_hi = expected_conf_range(bmi)
         conf_ok  = PASS if conf_lo <= conf <= conf_hi else WARN
         zorder   = PASS if z_end > z_start else FAIL
 
-        # Collect failures
+        # Cache failed cases to build localized error reports
         if FAIL in (span_ok, zorder):
             failures.append((cat, label, span_ok, conf_ok, zorder,
                              span, span_lo, span_hi, conf, z_start, z_end))
@@ -213,70 +226,71 @@ def run_tests():
 
         results.append({"pass": FAIL not in (span_ok, zorder)})
 
-    # ── Summary ──
     print("\n" + "=" * len(header))
     total  = len(results)
     passed = sum(1 for r in results if r["pass"])
     failed = total - passed
 
-    print(f"\n  RESULTS: {passed}/{total} passed  |  {failed} failed\n")
+    print(f"\n📊 SUMMARY REPORT: {passed}/{total} profiles passed  |  {failed} failures discovered\n")
 
     if failures:
-        print("  FAILURES DETAIL:")
+        print("🚨 DETAILED FAILURE BREAKDOWNS:")
         for f in failures:
             cat, label, span_ok, conf_ok, zorder, span, slo, shi, conf, zs, ze = f
-            print(f"    [{cat}] {label}")
+            print(f"    [{cat}] Profile '{label}':")
             if span_ok == FAIL:
-                print(f"           Span {span:.1f}mm outside expected [{slo}–{shi}mm]")
+                print(f"         ↳ Error: Computed span {span:.1f}mm broken outside bounds [{slo}–{shi}mm]")
             if zorder == FAIL:
-                print(f"           Z-order violation: start({zs}) >= end({ze})")
+                print(f"         ↳ Error: Spatial inversion occurred! Start ({zs}mm) >= End ({ze}mm)")
     else:
-        print("  All checks passed! ✅")
+        print("🎉 EXCELLENT: All anatomical configurations cleared constraints.")
 
-    # ── Category 3 span consistency check ──
-    print("\n  CATEGORY 3 — Span Consistency (same patient 170cm/75kg):")
-    cat3 = [(l, s) for c, l, h, w, s in ALL_TESTS
-            if c == "CAT3" and h == 170 and w == 75]
+    # ── Category 3: Protocol Range Consistency Validation ──
+    print("\n📦 CATEGORY 3 — Volumetric Boundary Proportions (Patient: 170cm/75kg):")
+    cat3 = [(l, s) for c, l, h, w, s in ALL_TESTS if c == "CAT3"]
     for label, scan in cat3:
         lm = simulate_nnLandmark(170, 75)
         r  = reasoning_agent(scan, lm, 170, 75)
         span = r["z_end_mm"] - r["z_start_mm"]
-        print(f"    {scan:<35} Span={span:.1f}mm  Protocol={r['protocol_id']}")
+        print(f"    {scan:<32} Calculated Span: {span:.1f}mm | Hardware Target: {r['protocol_id']}")
 
-    # ── Category 4 Z-scaling linearity check ──
-    print("\n  CATEGORY 4 — Z-Start Linearity with Height:")
+    # ── Category 4: Height Expansion Linearity Validation ──
+    print("\n📏 CATEGORY 4 — Height Linear Tracking Scaling Checks:")
     cat4 = [(l, h, w) for c, l, h, w, s in ALL_TESTS if c == "CAT4"]
     prev_zs = 0
-    ok = True
+    linearity_valid = True
     for label, h, w in cat4:
         lm = simulate_nnLandmark(h, w)
         r  = reasoning_agent("Chest CT", lm, h, w)
         zs = r["z_start_mm"]
-        arrow = "↑" if zs > prev_zs else ("→" if zs == prev_zs else "↓ ❌")
-        print(f"    H={h:>5.0f}cm  Z-Start={zs:>7.1f}mm  {arrow}")
+        trend_arrow = "↑" if zs > prev_zs else ("→" if zs == prev_zs else "↓ [FAILED]")
+        print(f"    Target Stature: {h:>3.0f}cm | Z-Axis Hardware Start: {zs:>7.1f}mm | {trend_arrow}")
         if zs < prev_zs and prev_zs > 0:
-            ok = False
+            linearity_valid = False
         prev_zs = zs
-    print(f"    Linear scaling: {'✅ OK' if ok else '❌ NOT LINEAR'}")
+    print(f"    Conclusion: {'✅ Height Linear Progression Confirmed' if linearity_valid else '❌ Linearity Distortion Detected'}")
 
-    # ── Confidence monotonicity check ──
-    print("\n  CONFIDENCE — Monotonic Decrease with BMI (Chest CT, H=165):")
-    bmi_steps = [(165, 42), (165, 57), (165, 72), (165, 90), (165, 110), (165, 140)]
+    # ── Verification of Model Confidence Degradation ──
+    print("\n📉 MODEL SECURITY — Monotonic Confidence Shift Evaluation (Chest CT, H=165):")
+    bmi_sweeps = [(165, 42), (165, 57), (165, 72), (165, 90), (165, 110), (165, 140)]
     prev_conf = 1.0
-    mono_ok = True
-    for h, w in bmi_steps:
-        bmi = w / ((h/100)**2)
+    monotonic_valid = True
+    for h, w in bmi_sweeps:
+        bmi = w / ((h / 100) ** 2)
         lm  = simulate_nnLandmark(h, w)
         r   = reasoning_agent("Chest CT", lm, h, w)
         c   = r["confidence"]
-        arrow = "↓" if c < prev_conf else ("→" if c == prev_conf else "↑ ❌")
-        print(f"    BMI={bmi:>5.1f}  Conf={c:.3f}  {arrow}")
+        trend_arrow = "↓" if c < prev_conf else ("→" if c == prev_conf else "↑ [FAILED]")
+        print(f"    Calculated BMI: {bmi:>5.1f} | Pipeline Confidence: {c:.3f} | {trend_arrow}")
         if c > prev_conf:
-            mono_ok = False
+            monotonic_valid = False
         prev_conf = c
-    print(f"    Monotonic: {'✅ OK' if mono_ok else '❌ NOT MONOTONIC'}")
+    print(f"    Conclusion: {'✅ Confidence Decreases Monotonically as Tissue Noise Increases' if monotonic_valid else '❌ Monotonic Rules Broken'}\n")
 
-    print("\n" + "=" * len(header) + "\n")
+    # Enforce standard exit signals based on structural execution accuracy
+    if failed > 0 or not linearity_valid or not monotonic_valid:
+        sys.exit(1)
+    sys.exit(0)
 
 
 if __name__ == "__main__":

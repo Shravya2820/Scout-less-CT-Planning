@@ -1,18 +1,21 @@
 """
 Scout-less CT Scan Planning System
-B.Tech Project Prototype — Orchestration Layer (Upgraded Architecture)
+Orchestration Layer (Upgraded Architecture)
 """
 
 import streamlit as st
 import numpy as np
 import matplotlib.pyplot as plt
 import matplotlib.patches as mpatches
-from matplotlib.patches import FancyArrowPatch
-import os
-import json
-import time
+import matplotlib.patheffects as pe
+from matplotlib.patches import FancyArrowPatch, Ellipse, FancyBboxPatch
+from matplotlib.path import Path
+import matplotlib.patches as mpatches
+import os, json, time, re
 from datetime import datetime
-from scipy.ndimage import distance_transform_edt
+from scipy.ndimage import distance_transform_edt, gaussian_filter
+from dotenv import load_dotenv
+load_dotenv()
 
 # ── Page config ──────────────────────────────────────────────────────────────
 st.set_page_config(
@@ -360,6 +363,26 @@ div[data-testid="stExpander"] {
     border: 1px solid #1e3a5f !important;
     border-radius: 8px !important;
 }
+
+/* LLM badge */
+.llm-badge {
+    display: inline-flex; align-items: center; gap: 6px;
+    background: linear-gradient(135deg, #0a1a3a, #001830);
+    border: 1px solid #0070d0; border-radius: 20px;
+    padding: 3px 12px; font-size: 0.68rem; color: #40b0ff;
+    font-family: 'Space Mono', monospace; letter-spacing: 0.08em;
+    margin-bottom: 10px; font-weight: 700;
+}
+.llm-badge .dot { width: 6px; height: 6px; border-radius: 50%;
+    background: #00d4ff; animation: blink 1.4s infinite; }
+@keyframes blink { 0%,100%{opacity:1} 50%{opacity:0.2} }
+.llm-source-badge {
+    font-size: 0.62rem; padding: 2px 8px; border-radius: 4px;
+    font-family: 'Space Mono', monospace; display: inline-block; margin-left: 6px;
+}
+.llm-ollama  { background:#0a2010; color:#00c878; border:1px solid #00c87840; }
+.llm-groq    { background:#1a1000; color:#ffaa00; border:1px solid #ffaa0040; }
+.llm-fallback{ background:#0a0a20; color:#6a9ec0; border:1px solid #2a4a7040; }
 </style>
 """, unsafe_allow_html=True)
 
@@ -610,101 +633,521 @@ def retrieve_protocol(query: str, vectorstore, mode: str) -> str:
     return CT_PROTOCOL_KB.split("\n\n")[0]
 
 
-# ── 3. UPGRADED REASONING & SAFETY GATE ───────────────────────────────────────
+# ── 3. LLAMA 3 REASONING CHAIN ────────────────────────────────────────────────
 
-def reasoning_agent(scan_type: str, landmarks: dict, protocol_text: str,
-                    height: float, weight: float, combined_sensor_conf: float) -> dict:
-    """
-    Upgraded Reasoning Engine. Integrates aleatoric spatial peak uncertainty,
-    BMI constraints, and sensor fusion tracking metrics to safeguard scan planning.
-    """
+# Structured JSON schema Llama must return
+_LLAMA_SYSTEM = """You are a Senior Clinical Radiologist and CT Protocol Specialist.
+Your task: given patient biometrics, detected anatomical landmarks, and a retrieved
+CT protocol, compute exact Z-axis scan boundaries and provide a 2-sentence clinical
+justification.
+
+RULES:
+- Always cite the Protocol ID in your rationale.
+- If BMI is outside 18–35, OR any landmark peak_width > 7.5 mm, set low_confidence=true
+  and recommend "Manual Scout Over-ride".
+- Return ONLY valid JSON — no markdown, no preamble, no extra keys.
+
+OUTPUT SCHEMA (strict):
+{
+  "suggested_start_z": <float mm>,
+  "suggested_end_z":   <float mm>,
+  "protocol_id":       <string>,
+  "medical_rationale": <2-sentence string citing protocol and patient BMI>,
+  "low_confidence":    <true|false>,
+  "override_message":  <string or "">
+}"""
+
+_LLAMA_HUMAN = """PATIENT CONTEXT:
+- Height: {height_cm} cm | Weight: {weight_kg} kg | BMI: {bmi:.1f}
+- Age group: {age_note}
+- Scan requested: {scan_type}
+
+DETECTED LANDMARKS (Soft-Argmax, sub-voxel mm):
+- Carina (T4-T5):        Z = {carina_z:.1f} mm  | Peak Width (uncertainty): {carina_pw:.2f} mm
+- T12 Vertebra:          Z = {t12_z:.1f} mm    | Peak Width (uncertainty): {t12_pw:.2f} mm
+- Pubic Symphysis:       Z = {pubis_z:.1f} mm  | Peak Width (uncertainty): {pubis_pw:.2f} mm
+
+MULTI-MODAL FUSION CONFIDENCE: {fusion_conf:.1%}
+(RGB={rgb_c:.2f} | Depth={dep_c:.2f} | IR={ir_c:.2f})
+
+RETRIEVED PROTOCOL (FAISS RAG):
+{protocol_text}
+
+Using ONLY the landmark Z coordinates and the protocol above, compute the scan boundaries.
+Apply the stated Z-Start and Z-End offsets from the protocol. Return JSON only."""
+
+
+def _rule_based_fallback(scan_type: str, landmarks: dict, protocol_text: str,
+                          height: float, weight: float,
+                          combined_sensor_conf: float) -> dict:
+    """Original rule-based engine — used when no LLM is available."""
     bmi = weight / ((height / 100) ** 2)
-
     carina_z = landmarks["Carina (Sternum Anchor)"]["coords"][2]
     t12_z    = landmarks["T12 Vertebra"]["coords"][2]
     pubis_z  = landmarks["Pubic Symphysis"]["coords"][2]
+    max_pw   = max(lm["peak_width"] for lm in landmarks.values())
 
-    # Evaluate Max Peak Width among tracked structures as an Aleatoric Uncertainty metric
-    max_peak_width = max(lm["peak_width"] for lm in landmarks.values())
-    
-    scan_type_l = scan_type.lower()
-    safety_trigger = False
-    safety_message = ""
+    safety_trigger = max_pw > 7.5 or bmi > 45.0 or combined_sensor_conf < 0.70
+    safety_message = ("High Uncertainty Detected: Reverting to Ultra-Low Dose Scout Validation."
+                      if safety_trigger else "")
 
-    # ── CRITICAL SAFETY GATE EVALUATION ──
-    # Triggers an auto-override under extreme obesity or systemic tracking uncertainty
-    
-    if max_peak_width > 7.5 or bmi > 45.0 or combined_sensor_conf < 0.70:
-        safety_trigger = True
-        safety_message = "CRITICAL METRIC HIGH UNCERTAINTY DETECTED: Reverting to Ultra-Low Dose Scout Validation."
-
-    if "chest" in scan_type_l and "abdomen" not in scan_type_l:
-        z_start = carina_z - 20
-        z_end = t12_z + 5
-        start_anatomy = "~2 cm superior to lung apex (C7 level)"
-        end_anatomy = "T12 inferior border (diaphragm)"
-        protocol_id = "CHEST-001"
-        confidence = 0.93 * combined_sensor_conf - (max_peak_width * 0.01)
-
-    elif "abdomen" in scan_type_l and "pelvis" not in scan_type_l:
-        z_start = t12_z - 15
-        z_end = pubis_z + 10
-        start_anatomy = "Diaphragm dome (T8–T9 superior to liver)"
-        end_anatomy = "Pubic symphysis inferior border"
-        protocol_id = "ABD-001"
-        confidence = 0.90 * combined_sensor_conf - (max_peak_width * 0.015)
-
-    elif "pelvis" in scan_type_l and "chest" not in scan_type_l and "cap" not in scan_type_l:
-        z_start = pubis_z - 160
-        z_end = pubis_z + 25
-        start_anatomy = "Iliac crest (L4–L5)"
-        end_anatomy = "Pubic symphysis + ischial tuberosities"
-        protocol_id = "PELVIS-001"
-        confidence = 0.88 * combined_sensor_conf - (max_peak_width * 0.01)
-
-    else: # CAP - Chest-Abdomen-Pelvis
-        z_start = carina_z - 20
-        z_end = pubis_z + 10
-        start_anatomy = "~2 cm above lung apex"
-        end_anatomy = "Pubic symphysis inferior border"
-        protocol_id = "CHEST-ABD-001"
-        confidence = 0.89 * combined_sensor_conf - (max_peak_width * 0.02)
-
-    # Apply safety adjustments to final confidence metrics
-    if safety_trigger:
-        confidence = float(np.clip(confidence * 0.5, 0.30, 0.55))
-        rationale = (
-            f"🚨 SAFETY REASONING OVERRIDE ACTIVATED.\n"
-            f"Reasoning Context: Peak Width spatial uncertainty is at {max_peak_width:.2f} (Threshold 6.2) "
-            f"or Patient BMI is {bmi:.1f} (Threshold 45.0).\n"
-            f"Action: {safety_message} Manual scout validation mandatory to prevent anatomical cropping."
-        )
+    s = scan_type.lower()
+    if "chest" in s and "abdomen" not in s and "cap" not in s:
+        z_start, z_end = carina_z - 20, t12_z + 5
+        start_a, end_a = "~2 cm superior to lung apex (C7)", "T12 inferior border"
+        pid, base_c = "CHEST-001", 0.93
+    elif "abdomen" in s and "pelvis" not in s and "cap" not in s:
+        z_start, z_end = t12_z - 15, pubis_z + 10
+        start_a, end_a = "Diaphragm dome (T8–T9)", "Pubic symphysis inferior"
+        pid, base_c = "ABD-001", 0.90
+    elif "pelvis" in s and "chest" not in s and "cap" not in s:
+        z_start, z_end = pubis_z - 160, pubis_z + 25
+        start_a, end_a = "Iliac crest (L4–L5)", "Pubic symphysis + ischial tub."
+        pid, base_c = "PELVIS-001", 0.88
     else:
-        confidence = float(np.clip(confidence, 0.60, 0.98))
-        rationale = (
-            f"Protocol {protocol_id} verified. Multi-modal sensor fusion input context resolved with "
-            f"{(combined_sensor_conf*100):.1f}% confidence parameters. Sub-voxel Soft-Argmax calculation maps "
-            f"Carina at Z={carina_z:.1f} mm, T12 at Z={t12_z:.1f} mm. Aleatoric variance within thresholds "
-            f"(Peak Width max = {max_peak_width:.2f} mm). Optimal structural boundary mapping is locked."
-        )
+        z_start, z_end = carina_z - 20, pubis_z + 10
+        start_a, end_a = "~2 cm above lung apex", "Pubic symphysis inferior"
+        pid, base_c = "CHEST-ABD-001", 0.89
+
+    conf = float(np.clip(base_c * combined_sensor_conf - max_pw * 0.01, 0.30, 0.98))
+    if safety_trigger:
+        conf = float(np.clip(conf * 0.5, 0.30, 0.55))
+        rationale = (f"⚠ SAFETY GATE ACTIVE — Peak Width {max_pw:.2f} mm / BMI {bmi:.1f}. "
+                     f"{safety_message} Manual scout mandatory.")
+    else:
+        rationale = (f"Protocol {pid} verified via RAG. Carina at Z={carina_z:.0f} mm, "
+                     f"T12 at Z={t12_z:.0f} mm. Fusion confidence {combined_sensor_conf:.1%}. "
+                     f"BMI={bmi:.1f} — aleatoric variance within thresholds (max PW={max_pw:.2f} mm).")
 
     return {
-        "protocol_id": protocol_id,
-        "z_start_mm": round(z_start, 1),
-        "z_end_mm": round(z_end, 1),
-        "start_anatomy": start_anatomy,
-        "end_anatomy": end_anatomy,
-        "confidence": confidence,
-        "rationale": rationale,
+        "protocol_id":    pid,
+        "z_start_mm":     round(z_start, 1),
+        "z_end_mm":       round(z_end, 1),
+        "start_anatomy":  start_a,
+        "end_anatomy":    end_a,
+        "confidence":     conf,
+        "rationale":      rationale,
         "retrieved_protocol": protocol_text,
         "safety_trigger": safety_trigger,
-        "safety_message": safety_message
+        "safety_message": safety_message,
+        "llm_backend":    "rule_fallback",
     }
 
 
-# ── 4. ENHANCED HEATMAP VISUALIZATION ─────────────────────────────────────────
+def reasoning_agent(scan_type: str, landmarks: dict, protocol_text: str,
+                    height: float, weight: float,
+                    combined_sensor_conf: float,
+                    llm_backend: str = "auto",
+                    groq_api_key: str = "") -> dict:
+    """
+    LlamaReasoningChain — Clinical Decision Support System.
 
-def plot_human_silhouette(landmarks: dict, result: dict, height_cm: float) -> plt.Figure:
+    Tries backends in this order (based on llm_backend setting):
+      1. Ollama  (local Llama 3 — zero cost, best for demo)
+      2. Groq    (cloud Llama 3 — needs API key, fastest)
+      3. Rule-based fallback (always available)
+
+    The LLM receives: patient biometrics, Soft-Argmax landmark Z coordinates,
+    peak-width aleatoric uncertainty, fusion confidence, and the RAG-retrieved
+    protocol.  It returns structured JSON with z_start, z_end, rationale,
+    low_confidence flag, and override message.
+    """
+    bmi = weight / ((height / 100) ** 2)
+    carina_z  = landmarks["Carina (Sternum Anchor)"]["coords"][2]
+    t12_z     = landmarks["T12 Vertebra"]["coords"][2]
+    pubis_z   = landmarks["Pubic Symphysis"]["coords"][2]
+    carina_pw = landmarks["Carina (Sternum Anchor)"]["peak_width"]
+    t12_pw    = landmarks["T12 Vertebra"]["peak_width"]
+    pubis_pw  = landmarks["Pubic Symphysis"]["peak_width"]
+
+    fv = landmarks.get("_fusion_vector", [0.9, 0.9, 0.9])
+    age_note = "Paediatric (<18)" if height < 145 else "Adult (18–60)" if height < 185 else "Tall adult (>185 cm)"
+
+    human_msg = _LLAMA_HUMAN.format(
+        height_cm=height, weight_kg=weight, bmi=bmi,
+        age_note=age_note, scan_type=scan_type,
+        carina_z=carina_z, carina_pw=carina_pw,
+        t12_z=t12_z, t12_pw=t12_pw,
+        pubis_z=pubis_z, pubis_pw=pubis_pw,
+        fusion_conf=combined_sensor_conf,
+        rgb_c=fv[0], dep_c=fv[1], ir_c=fv[2],
+        protocol_text=protocol_text[:800],
+    )
+
+    llm_response = None
+    used_backend = "rule_fallback"
+
+    # ── Try Ollama (local Llama 3) ────────────────────────────────────────────
+    if llm_backend in ("auto", "ollama"):
+        try:
+            from langchain_ollama import ChatOllama
+            from langchain_core.messages import SystemMessage, HumanMessage
+            llm = ChatOllama(model="llama3", temperature=0.1,
+                             timeout=25, base_url="http://localhost:11434")
+            resp = llm.invoke([SystemMessage(content=_LLAMA_SYSTEM),
+                               HumanMessage(content=human_msg)])
+            llm_response = resp.content
+            used_backend = "ollama"
+        except Exception:
+            pass
+
+    # ── Try Groq (cloud Llama 3) ──────────────────────────────────────────────
+    if llm_response is None and llm_backend in ("auto", "groq") and groq_api_key:
+        try:
+            from langchain_groq import ChatGroq
+            from langchain_core.messages import SystemMessage, HumanMessage
+            llm = ChatGroq(model="llama-3.3-70b-versatile", temperature=0.1,
+                           groq_api_key=groq_api_key)
+            resp = llm.invoke([SystemMessage(content=_LLAMA_SYSTEM),
+                               HumanMessage(content=human_msg)])
+            llm_response = resp.content
+            used_backend = "groq"
+            st.session_state["_llm_raw"] = llm_response
+        except Exception:
+            pass
+
+    # ── Parse JSON from LLM response ─────────────────────────────────────────
+    if llm_response is not None:
+        try:
+            # Strip any markdown fences the model may have added
+            clean = re.sub(r"```(?:json)?|```", "", llm_response).strip()
+            parsed = json.loads(clean)
+
+            z_start  = float(parsed["suggested_start_z"])
+            z_end    = float(parsed["suggested_end_z"])
+            pid      = str(parsed.get("protocol_id", "CHEST-001"))
+            rationale= str(parsed.get("medical_rationale", ""))
+            low_conf = bool(parsed.get("low_confidence", False))
+            override = str(parsed.get("override_message", ""))
+
+            # Sanity-check the LLM output
+            if z_end <= z_start or z_start < 0 or z_end > height * 12:
+                raise ValueError("LLM returned physically invalid Z values")
+
+            safety_trigger = low_conf
+            safety_message = override if override else (
+                "High Uncertainty Detected: Reverting to Ultra-Low Dose Scout Validation."
+                if low_conf else "")
+
+            # Derive anatomy labels from protocol_id
+            _anatomy = {
+                "CHEST-001":     ("~2 cm superior to lung apex", "T12 inferior border"),
+                "ABD-001":       ("Diaphragm dome (T8–T9)",      "Pubic symphysis inferior"),
+                "PELVIS-001":    ("Iliac crest (L4–L5)",         "Pubic symphysis + ischial tub."),
+                "CHEST-ABD-001": ("~2 cm above lung apex",       "Pubic symphysis inferior"),
+            }
+            start_a, end_a = _anatomy.get(pid, ("Computed by LLM", "Computed by LLM"))
+
+            max_pw = max(lm["peak_width"] for lm in landmarks.values())
+            conf_raw = 0.93 * combined_sensor_conf - max_pw * 0.01
+            if safety_trigger:
+                conf_raw *= 0.55
+            confidence = float(np.clip(conf_raw, 0.30, 0.98))
+
+            return {
+                "protocol_id":       pid,
+                "z_start_mm":        round(z_start, 1),
+                "z_end_mm":          round(z_end, 1),
+                "start_anatomy":     start_a,
+                "end_anatomy":       end_a,
+                "confidence":        confidence,
+                "rationale":         rationale,
+                "retrieved_protocol":protocol_text,
+                "safety_trigger":    safety_trigger,
+                "safety_message":    safety_message,
+                "llm_backend":       used_backend,
+            }
+        except Exception:
+            pass   # fall through to rule-based
+
+    # ── Rule-based fallback ───────────────────────────────────────────────────
+    result = _rule_based_fallback(scan_type, landmarks, protocol_text,
+                                   height, weight, combined_sensor_conf)
+    result["llm_backend"] = "rule_fallback"
+    return result
+
+
+
+
+# ── 4. ANATOMICAL SILHOUETTE WITH ORGANS ──────────────────────────────────────
+
+def plot_human_silhouette(landmarks: dict, result: dict, height_cm: float,
+                           sex: str = "Male", bmi: float = 22.0) -> plt.Figure:
+    """
+    Renders a detailed anatomical human silhouette that adapts to:
+      - Sex  : Male vs Female body shape (shoulder/hip ratio, breast outline)
+      - BMI  : silhouette width scales with adiposity
+      - Scan : organ highlights match the selected scan type
+    Overlays glowing EDT heatmap blobs, Soft-Argmax landmark markers,
+    schematic internal organs, and clear START / END scan boundary lines.
+    """
+    fig, ax = plt.subplots(figsize=(5.0, 10.0))
+    fig.patch.set_facecolor('#080d18')
+    ax.set_facecolor('#080d18')
+
+    H = height_cm * 10
+    def z_to_y(z): return float(z) / H
+
+    is_female = "female" in sex.lower()
+    bmi_scale = float(np.clip((bmi - 18.5) / 25.0, 0.0, 1.0))  # 0=lean, 1=obese
+
+    # ── Body width scalars ────────────────────────────────────────────────────
+    shoulder_w = (0.195 if is_female else 0.230) + bmi_scale * 0.040
+    hip_w      = (0.225 if is_female else 0.185) + bmi_scale * 0.055
+    waist_w    = (0.150 if is_female else 0.160) + bmi_scale * 0.060
+    torso_depth_factor = 1.0 + bmi_scale * 0.35   # used for organ sizing hints
+
+    cx = 0.50   # centre x
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # BODY OUTLINE (filled polygon, spine-region darker)
+    # Points go: left shoulder → left waist → left hip → crotch → right ...
+    # ─────────────────────────────────────────────────────────────────────────
+    sh_y, hip_y, crotch_y = 0.20, 0.62, 0.72
+    waist_y = (sh_y + hip_y) / 2 + 0.02
+
+    left_x  = [cx - shoulder_w, cx - waist_w,  cx - hip_w,   cx - hip_w*0.6]
+    left_y  = [sh_y,            waist_y,        hip_y,        crotch_y]
+    right_x = [cx + shoulder_w, cx + waist_w,  cx + hip_w,   cx + hip_w*0.6]
+    right_y = left_y
+
+    # Combine into closed polygon
+    body_xs = left_x  + [cx] + list(reversed(right_x)) + [cx + shoulder_w]
+    body_ys = left_y  + [crotch_y] + list(reversed(right_y)) + [sh_y]
+    body_fill = '#0d1f38'
+    body_edge = '#2a5a8a'
+
+    ax.fill(body_xs, body_ys, color=body_fill, zorder=2, alpha=0.95)
+    ax.plot(body_xs + [body_xs[0]], body_ys + [body_ys[0]],
+            color=body_edge, lw=1.8, zorder=3)
+
+    # ── Head ─────────────────────────────────────────────────────────────────
+    head_r  = 0.072 + bmi_scale * 0.010
+    head_cy = 0.095
+    head = Ellipse((cx, head_cy), head_r * 2, head_r * 2.1,
+                   color='#0e1e38', zorder=3)
+    ax.add_patch(head)
+    # head outline
+    theta = np.linspace(0, 2*np.pi, 80)
+    ax.plot(cx + head_r * np.cos(theta),
+            head_cy + head_r * 1.05 * np.sin(theta),
+            color=body_edge, lw=1.5, zorder=4)
+
+    # Neck
+    neck_w = 0.030 + bmi_scale * 0.012
+    ax.fill([cx-neck_w, cx-neck_w, cx+neck_w, cx+neck_w],
+            [head_cy+head_r*0.7, sh_y, sh_y, head_cy+head_r*0.7],
+            color='#0d1f38', zorder=3)
+    ax.plot([cx-neck_w, cx-neck_w], [head_cy+head_r*0.7, sh_y],
+            color=body_edge, lw=1.5, zorder=4)
+    ax.plot([cx+neck_w, cx+neck_w], [head_cy+head_r*0.7, sh_y],
+            color=body_edge, lw=1.5, zorder=4)
+
+    # ── Arms ─────────────────────────────────────────────────────────────────
+    arm_w   = 5 + bmi_scale * 3
+    elbow_y = (sh_y + hip_y) / 2
+    hand_y  = hip_y + 0.06
+    for sign in (-1, +1):
+        xs = [cx + sign*(shoulder_w - 0.01),
+              cx + sign*(shoulder_w + 0.07),
+              cx + sign*(shoulder_w + 0.085),
+              cx + sign*(shoulder_w + 0.05)]
+        ys = [sh_y, elbow_y, (elbow_y+hand_y)/2, hand_y]
+        ax.plot(xs, ys, color=body_edge, lw=arm_w,
+                solid_capstyle='round', zorder=2)
+
+    # ── Female breast outline ─────────────────────────────────────────────────
+    if is_female:
+        breast_y = sh_y + 0.10
+        breast_r_x = 0.055 + bmi_scale * 0.025
+        breast_r_y = 0.040 + bmi_scale * 0.020
+        for sign in (-1, +1):
+            b = Ellipse((cx + sign * 0.055, breast_y),
+                        breast_r_x * 2, breast_r_y * 2,
+                        color='#122a48', zorder=4, alpha=0.7)
+            ax.add_patch(b)
+            ax.plot(cx + sign*0.055 + breast_r_x*np.cos(theta),
+                    breast_y + breast_r_y*np.sin(theta),
+                    color='#3a6a9a', lw=0.8, alpha=0.6, zorder=5)
+
+    # ── Legs ─────────────────────────────────────────────────────────────────
+    leg_w   = 10 + bmi_scale * 6
+    knee_y  = 0.855
+    foot_y  = 1.00
+    for sign, leg_x in ((-1, cx - hip_w*0.42), (+1, cx + hip_w*0.42)):
+        ax.plot([leg_x, leg_x + sign*0.015, leg_x + sign*0.010, leg_x],
+                [crotch_y, knee_y, (knee_y+foot_y)/2, foot_y],
+                color=body_edge, lw=leg_w, solid_capstyle='round', zorder=2)
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # INTERNAL ORGANS (schematic, dim, inside the torso)
+    # ─────────────────────────────────────────────────────────────────────────
+    org_alpha = 0.28
+
+    # Lungs
+    lung_top_y    = z_to_y(H * 0.22)
+    lung_bottom_y = z_to_y(H * 0.45)
+    lung_h        = lung_bottom_y - lung_top_y
+    lung_cx_off   = 0.068
+    for sign in (-1, +1):
+        lung = Ellipse((cx + sign * lung_cx_off,
+                        (lung_top_y + lung_bottom_y) / 2),
+                       0.090, lung_h,
+                       color='#1a4a6a', alpha=org_alpha, zorder=3)
+        ax.add_patch(lung)
+        ax.plot(cx + sign*lung_cx_off + 0.045*np.cos(theta),
+                (lung_top_y+lung_bottom_y)/2 + lung_h/2*np.sin(theta),
+                color='#2a7aaa', lw=0.6, alpha=org_alpha*1.5, zorder=3)
+
+    # Heart (left-centred)
+    heart_cy = z_to_y(H * 0.28)
+    heart = Ellipse((cx - 0.028, heart_cy), 0.055, 0.060,
+                    color='#3a1a2a', alpha=org_alpha * 1.4, zorder=4)
+    ax.add_patch(heart)
+    ax.plot(cx - 0.028 + 0.028*np.cos(theta),
+            heart_cy + 0.030*np.sin(theta),
+            color='#8a2a4a', lw=0.7, alpha=org_alpha*2, zorder=4)
+
+    # Liver (right upper abdomen)
+    liver_cy = z_to_y(H * 0.505)
+    liver = Ellipse((cx + 0.050, liver_cy), 0.110, 0.060,
+                    color='#2a1a0a', alpha=org_alpha * 1.6, zorder=3)
+    ax.add_patch(liver)
+    ax.plot(cx + 0.050 + 0.055*np.cos(theta),
+            liver_cy + 0.030*np.sin(theta),
+            color='#7a3a1a', lw=0.6, alpha=org_alpha*2, zorder=3)
+
+    # Stomach (left mid-abdomen)
+    stom_cy = z_to_y(H * 0.515)
+    stomach = Ellipse((cx - 0.055, stom_cy), 0.070, 0.050,
+                      color='#1a2a1a', alpha=org_alpha, zorder=3)
+    ax.add_patch(stomach)
+
+    # Kidneys
+    kid_cy  = z_to_y(H * 0.545)
+    kid_h   = 0.055 * (1 + bmi_scale*0.1)
+    for sign in (-1, +1):
+        kid = Ellipse((cx + sign * 0.080, kid_cy),
+                      0.030, kid_h,
+                      color='#1a2a0a', alpha=org_alpha*1.5, zorder=3)
+        ax.add_patch(kid)
+        ax.plot(cx + sign*0.080 + 0.015*np.cos(theta),
+                kid_cy + kid_h/2*np.sin(theta),
+                color='#3a6a2a', lw=0.6, alpha=org_alpha*2, zorder=3)
+
+    # Intestines / bowel (mid-lower abdomen)
+    bowel_cy = z_to_y(H * 0.610)
+    bowel = Ellipse((cx, bowel_cy), 0.165 + bmi_scale*0.03, 0.080,
+                    color='#1a1a2a', alpha=org_alpha, zorder=3)
+    ax.add_patch(bowel)
+
+    # Bladder (lower pelvis)
+    blad_cy = z_to_y(H * 0.72)
+    bladder = Ellipse((cx, blad_cy), 0.055, 0.040,
+                      color='#0a1a2a', alpha=org_alpha*1.2, zorder=3)
+    ax.add_patch(bladder)
+
+    # Spine (midline dotted line)
+    spine_top  = z_to_y(H * 0.16)
+    spine_bot  = z_to_y(H * 0.73)
+    ax.plot([cx, cx], [spine_top, spine_bot],
+            color='#2a4a6a', lw=1.0, linestyle=':', alpha=0.5, zorder=4)
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # HEATMAP PROBABILITY BLOBS
+    # ─────────────────────────────────────────────────────────────────────────
+    for name, lm in landmarks.items():
+        z_c   = lm["coords"][2]
+        y_c   = z_to_y(z_c)
+        color = lm["color"]
+        pw    = lm.get("peak_width", 6.0)
+
+        # Glowing Gaussian blob
+        sigma_y = pw / H * 1.8
+        sigma_x = 0.020 + bmi_scale * 0.005
+        y_span  = np.linspace(y_c - sigma_y*4, y_c + sigma_y*4, 60)
+        x_span  = np.linspace(0.28, 0.72, 30)
+        Xg, Yg  = np.meshgrid(x_span, y_span)
+        blob    = np.exp(-((Xg - cx)**2 / (2*sigma_x**2) +
+                           (Yg - y_c)**2  / (2*sigma_y**2)))
+
+        cname = {"#00d4ff": "cool", "#ffaa00": "Wistia",
+                 "#ff4466": "gist_heat"}.get(color, "cool")
+        ax.contourf(Xg, Yg, blob, levels=10,
+                    cmap=plt.get_cmap(cname), alpha=0.40, zorder=5)
+
+        # Soft-Argmax centre dot
+        ax.scatter(cx, y_c, s=55, color=color,
+                   edgecolors='#ffffff', linewidths=0.7, zorder=7, marker='o',
+                   path_effects=[pe.withStroke(linewidth=3, foreground='#00000066')])
+        ax.plot([0.24, 0.76], [y_c, y_c], color=color,
+                lw=0.7, alpha=0.35, linestyle='--', zorder=6)
+        ax.text(0.77, y_c, name.split("(")[0].strip(),
+                va='center', ha='left', fontsize=6.5,
+                color=color, fontfamily='monospace', fontweight='bold')
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # SCAN RANGE — prominent START / END with arrows & shading
+    # ─────────────────────────────────────────────────────────────────────────
+    y_start = z_to_y(result["z_start_mm"])
+    y_end   = z_to_y(result["z_end_mm"])
+    safety  = result.get("safety_trigger", False)
+
+    scan_color_fill = '#ff3322' if safety else '#0055cc'
+    lc_start = '#ffaa00' if safety else '#00ff88'
+    lc_end   = '#ff4444' if safety else '#ff4466'
+    lstyle   = (0, (4, 3)) if safety else '-'
+
+    # Shaded scan zone
+    rect = plt.Rectangle((0.22, y_start), 0.56, y_end - y_start,
+                          color=scan_color_fill, alpha=0.12, zorder=6)
+    ax.add_patch(rect)
+    # Side tick marks to make boundaries unmistakable
+    for side_x in (0.22, 0.78):
+        ax.plot([side_x - 0.015, side_x + 0.015], [y_start, y_start],
+                color=lc_start, lw=2.0, zorder=9)
+        ax.plot([side_x - 0.015, side_x + 0.015], [y_end, y_end],
+                color=lc_end, lw=2.0, zorder=9)
+
+    # Horizontal boundary lines
+    ax.axhline(y_start, xmin=0.0, xmax=1.0,
+               color=lc_start, lw=2.2, linestyle=lstyle, zorder=8, alpha=0.95)
+    ax.axhline(y_end,   xmin=0.0, xmax=1.0,
+               color=lc_end,   lw=2.2, linestyle=lstyle, zorder=8, alpha=0.95)
+
+    # Labels
+    ax.text(0.02, y_start - 0.013,
+            f"▶ START  Z={result['z_start_mm']:.0f} mm",
+            va='bottom', ha='left', fontsize=7, color=lc_start,
+            fontfamily='monospace', fontweight='bold')
+    ax.text(0.02, y_end + 0.007,
+            f"▶ END    Z={result['z_end_mm']:.0f} mm",
+            va='top', ha='left', fontsize=7, color=lc_end,
+            fontfamily='monospace', fontweight='bold')
+
+    # Double-headed span arrow
+    ax.annotate("", xy=(0.11, y_end), xytext=(0.11, y_start),
+                arrowprops=dict(arrowstyle='<->', color='#5aaae0', lw=1.2,
+                                mutation_scale=10))
+    span_mm = result["z_end_mm"] - result["z_start_mm"]
+    ax.text(0.025, (y_start + y_end) / 2,
+            f"{span_mm:.0f}\nmm", va='center', ha='left', fontsize=6.5,
+            color='#5aaae0', fontfamily='monospace', linespacing=1.4)
+
+    # ── Title & axes ─────────────────────────────────────────────────────────
+    sex_tag = "♀ FEMALE" if is_female else "♂ MALE"
+    bmi_tag = ("LEAN" if bmi < 22 else "NORMAL" if bmi < 25 else
+               "OVERWEIGHT" if bmi < 30 else f"OBESE BMI{bmi:.0f}")
+    ax.set_title(f"ANATOMICAL SCAN PLANNER  ·  {sex_tag}  ·  {bmi_tag}",
+                 fontsize=7.5, color='#4a7a9b',
+                 fontfamily='monospace', pad=8, fontweight='bold')
+    ax.set_xlim(0, 1)
+    ax.set_ylim(1.04, -0.04)
+    ax.axis('off')
+    plt.tight_layout(pad=0.2)
+    return fig
+
+
     """
     Renders an anatomical patient silhouette outline graph, plotting an advanced 
     2D projection mapping of volumetric probability heatmaps as smooth glowing gradients.
@@ -822,7 +1265,7 @@ def main():
     <div class="ct-header">
         <div>
             <h1>🩻 SCOUT-LESS CT PLANNER</h1>
-            <p>Multi-Modal Late-Fusion Heatmap Regression System</p>
+            <p>Multi-Modal Fusion · Heatmap Regression · Llama 3 Clinical Reasoning</p>
         </div>
     </div>
     """, unsafe_allow_html=True)
@@ -851,6 +1294,23 @@ def main():
         noise_level = st.slider("Heatmap Uncertainty (Noise Scale)", 0.5, 10.0, 2.5, 0.5)
         use_rag = st.checkbox("Enable RAG Protocol Retrieval", value=True)
         show_raw = st.checkbox("Show Raw Multi-Modal Metrics", value=False)
+
+        st.markdown('<div class="sidebar-section">🧠 LLM Reasoning Backend</div>', unsafe_allow_html=True)
+        llm_backend = st.selectbox(
+            "Reasoning Engine",
+            ["auto", "ollama (local Llama 3)", "groq (cloud Llama 3)", "rule-based only"],
+            help="auto = try Ollama → Groq → rule-based"
+        )
+        llm_backend_key = llm_backend.split()[0]   # extract 'auto','ollama','groq','rule-based'
+        groq_api_key = ""
+        if "groq" in llm_backend:
+            groq_api_key = st.text_input("Groq API Key", type="password",
+                                          placeholder="gsk_...",
+                                          help="Get free key at console.groq.com")
+        if llm_backend_key == "ollama":
+            st.caption("ℹ️ Requires Ollama running: `ollama run llama3`")
+        elif llm_backend_key == "auto":
+            st.caption("ℹ️ Tries Ollama → Groq → rule-based automatically")
 
         st.markdown("---")
         run_btn = st.button("▶  RUN MULTI-MODAL PLANNER", use_container_width=True, type="primary")
@@ -924,8 +1384,13 @@ def main():
             rag_mode = "disabled"
             
         # Step 5: Advanced Planning and Reasoning Matrix
-        progress_bar.progress(95, text="🧠 Evaluation agent assessing aleatoric uncertainty parameters...")
-        agent_plan = reasoning_agent(scan_type, processed_landmarks, protocol_text, height, weight, fusion_result["combined_confidence"])
+        progress_bar.progress(95, text="🧠 Llama 3 reasoning agent computing scan boundaries...")
+        agent_plan = reasoning_agent(
+            scan_type, processed_landmarks, protocol_text,
+            height, weight, fusion_result["combined_confidence"],
+            llm_backend=llm_backend_key,
+            groq_api_key=groq_api_key,
+        )
         progress_bar.progress(100, text="✅ Pipeline inference matrix loaded successfully.")
         time.sleep(0.04)
         progress_bar.empty()
@@ -946,10 +1411,17 @@ def main():
         vis_col, res_col = st.columns([1, 2], gap="large")
 
         with vis_col:
-            st.markdown('<div class="section-header">2D Coronal Heatmap Projections</div>', unsafe_allow_html=True)
-            fig = plot_human_silhouette(landmarks, result, height)
+            st.markdown('<div class="section-header">Anatomical Scan Planner</div>', unsafe_allow_html=True)
+            fig = plot_human_silhouette(landmarks, result, height, sex=sex, bmi=bmi)
             st.pyplot(fig, use_container_width=True)
             plt.close(fig)
+            st.markdown("""
+            <div class="hm-legend">
+                <span>Low prob</span>
+                <div class="hm-swatch"></div>
+                <span>High prob</span>
+                &nbsp;·&nbsp; Blobs = EDT heatmap confidence
+            </div>""", unsafe_allow_html=True)
 
         with res_col:
             # Safety Alert System Overrides
@@ -991,12 +1463,25 @@ def main():
                 <div class="confidence-bar-bg"><div class="confidence-bar-fill" style="width:{conf_pct}%; background:{bar_color};"></div></div>
             </div>""", unsafe_allow_html=True)
 
+            # ── LLM Debug expander ──
+            with st.expander("🔍 LLM Debug — Raw Response", expanded=False):
+                st.write("**Backend used:**", result.get("llm_backend", "unknown"))
+                st.write("**Raw LLM text:**", st.session_state.get("_llm_raw", "not captured"))
+
             # Context Explanations
             st.markdown('<div class="section-header">Medical Rationale & Safety Insights</div>', unsafe_allow_html=True)
             rag_tag = "FAISS+LangChain Vector Pipeline" if rag_mode == "langchain" else "KEYWORD MATRIX FALLBACK"
+            backend = result.get("llm_backend", "rule_fallback")
+            llm_cls  = {"ollama": "llm-ollama", "groq": "llm-groq"}.get(backend, "llm-fallback")
+            llm_lbl  = {"ollama": "⚡ Llama 3 · Ollama Local",
+                        "groq":   "⚡ Llama 3 · Groq Cloud",
+                        "rule_fallback": "📐 Rule-Based Engine"}.get(backend, "📐 Rule-Based Engine")
             st.markdown(f"""
             <div class="rationale-box">
-                <span class="rag-tag">⚡ RAG · {rag_tag}</span><br/>
+                <div style="margin-bottom:8px">
+                    <span class="rag-tag">⚡ RAG · {rag_tag}</span>
+                    <span class="llm-source-badge {llm_cls}">{llm_lbl}</span>
+                </div>
                 {result['rationale']}
             </div>""", unsafe_allow_html=True)
 
